@@ -1,0 +1,67 @@
+# Bundle patch for ios-dev-helper.
+#
+# A bundle patch is a top-level YAML array of Loader patch entries. A plugin row
+# must sit inside an `insert:` block — a row written at the top level is read as
+# an id-targeted *override* of an existing entry and inserts nothing.
+#
+# `install_bundle` selects this bundle in the active profile, and the Loader
+# applies these rows after the shipped bundle layers. Every config field below
+# is optional: the plugin falls back to the documented defaults when a key is
+# absent, so tune or delete them to taste.
+#
+# Pin every tool to one checkout. Without it the plugin falls back to the Agent's
+# working directory, which for a Host-spawned subprocess is the profile directory
+# (`~/.dsh/profiles/desktop`) — builds then auto-discover nothing and screenshots
+# land outside the project. Set it so `xcode_build`, the screenshot tools and the
+# idb tools all agree on where the workspace is. A per-call `cwd` still wins.
+- insert:
+    - id: ios-dev-helper
+      name: ios-dev-helper
+      config:
+        workspaceRoot: /Users/lumingfeng/Downloads/lunisolar-calendar-ios-main
+        # Absolute path to the Xcode CLI tools if they are not on PATH.
+        xcodebuildPath: xcodebuild
+        xcrunPath: xcrun
+        # Incremental builds: one stable DerivedData path keeps repeat builds warm
+        # instead of cold. Left unset on purpose — the default is
+        # `.dsh/DerivedData` under the build's working directory, and that default
+        # is applied only once the directory already exists. Uncomment the line
+        # below to use it unconditionally (xcodebuild then creates it), which also
+        # means the next build is a full rebuild at the new location. Add `.dsh/`
+        # to the repository's .gitignore first so products stay untracked.
+        # derivedDataPath: .dsh/DerivedData
+        # Where simulator_screenshot / simulator_tap write when no explicit `path`
+        # is passed. Relative to `workspaceRoot`, created on demand; `<repo>/.dsh/`
+        # is already in this repository's .gitignore, so captures stay untracked.
+        screenshotDir: .dsh/screenshots
+        # Touch injection and accessibility queries go through `idb`, because
+        # `simctl` has no tap command at all. A leading `~` is expanded by the
+        # plugin. This wrapper also puts its matching `idb_companion` on PATH.
+        # Installed at ~/.dsh/tools/idb (companion + user-space Python + fb-idb).
+        idbPath: ~/.dsh/tools/idb/bin/idb
+        # The first idb call in a session also starts the companion daemon.
+        idbTimeoutMs: 120000
+        # ios_dependencies shells out to CocoaPods / SwiftPM. `pod` is NOT
+        # installed on this machine, so a Podfile would be detected and then
+        # reported as "could not be launched" — install CocoaPods and/or point
+        # `podPath` at its absolute path if you add one. `swift` resolves via the
+        # Xcode toolchain and is present.
+        podPath: pod
+        swiftPath: swift
+        # A cold `pod install` downloads pods, so minutes are normal.
+        dependenciesTimeoutMs: 300000
+        # One xcodebuild invocation may legitimately take many minutes.
+        buildTimeoutMs: 900000
+        simctlTimeoutMs: 120000
+        # Per-stream in-memory output budget before the collector spills to disk.
+        maxOutputBytes: 8388608
+        # How much diagnostic detail reaches the model.
+        maxDiagnostics: 40
+        maxOutputChars: 6000
+        # SIGTERM -> SIGKILL grace period for a managed child.
+        graceMs: 3000
+        # The SwiftUI / Human Interface Guidelines system-prompt section.
+        injectSwiftUIGuidance: true
+        # This project's CI treats compiler warnings as failures. Set to false to
+        # let xcode_build report a warning-only build as ok.
+        treatWarningsAsErrors: true

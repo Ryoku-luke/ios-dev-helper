@@ -1,0 +1,62 @@
+{
+  "name": "ios-dev-helper",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "DeepSeek Harness plugin for iOS development: builds Xcode projects and parses compiler diagnostics, drives iOS Simulators (boot/install/launch/screenshot/logs/tap/accessibility), resolves CocoaPods and SwiftPM dependencies, and injects SwiftUI + Human Interface Guidelines guidance into the system prompt.",
+  "author": "Lumingfeng <lu-cool@qq.com>",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/Ryoku-luke/ios-dev-helper.git"
+  },
+  "homepage": "https://github.com/Ryoku-luke/ios-dev-helper#readme",
+  "bugs": {
+    "url": "https://github.com/Ryoku-luke/ios-dev-helper/issues"
+  },
+  "keywords": [
+    "dsh",
+    "deepseek-harness",
+    "cordis-plugin",
+    "ios",
+    "xcodebuild",
+    "simctl",
+    "ios-simulator",
+    "swiftui",
+    "human-interface-guidelines",
+    "cocoapods",
+    "swiftpm",
+    "idb",
+    "accessibility"
+  ],
+  "engines": {
+    "node": ">=22.6"
+  },
+  "main": "./lib/index.js",
+  "types": "./lib/types/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./lib/types/index.d.ts",
+      "default": "./lib/index.js"
+    },
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "lib",
+    "src",
+    "cordis.patch.yml"
+  ],
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "typecheck": "tsc -p tsconfig.json --noEmit"
+  },
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    }
+  },
+  "devDependencies": {
+    "@types/node": "^26.6.4",
+    "typescript": "^7.0.2"
+  }
+}

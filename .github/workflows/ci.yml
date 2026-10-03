@@ -1,0 +1,55 @@
+# ios-dev-helper 插件的 CI 门禁：确保 TypeScript 源码始终能编译。
+#
+# 这个文件位于本插件仓库的根目录——GitHub Actions 只读取仓库根部的
+# `.github/workflows/`，所以它现在的位置才是会真正生效的位置。
+#
+# 触发：每个分支的 push 与每个 PR。本仓库的内容就是插件本身，任何改动都与编译
+# 结果相关，因此不做 paths 过滤。
+name: CI
+
+on:
+  push:
+  pull_request:
+
+# 同一 ref 的新推送取消上一次仍在跑的任务。
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: pnpm install + pnpm run build
+    runs-on: ubuntu-latest
+    # 纯 TypeScript，不需要 macOS runner 或 Xcode。
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v7
+
+      # 必须早于 setup-node：后者的 `cache: pnpm` 要调用 pnpm 才能算出 store 路径。
+      - name: 配置 pnpm
+        uses: pnpm/action-setup@v6
+        with:
+          # 与开发机一致的 pnpm 版本（lockfile 也由它生成）。
+          version: 11.7.0
+
+      - name: 配置 Node.js
+        uses: actions/setup-node@v7
+        with:
+          # package.json 声明 engines.node >= 22.6；24.x 是开发所用的 LTS 线。
+          node-version: '24.x'
+          cache: pnpm
+
+      # --frozen-lockfile：lockfile 与 package.json 不一致时直接失败，而不是悄悄
+      # 改写依赖树——CI 要验的就是提交进来的这套依赖。
+      - name: pnpm install --frozen-lockfile
+        run: pnpm install --frozen-lockfile
+
+      # `pnpm run build` = `tsc -p tsconfig.json`。
+      # 注意 tsconfig 里 noEmitOnError: false —— 有类型错误时它依然会把 lib/ 写出来，
+      # 看起来像「编译过了」；但 tsc 的退出码在报错时非零，这一步会失败、job 变红。
+      # 所以不需要任何 `|| exit 1` 兜底，编译失败 CI 必然报错。
+      - name: pnpm run build（类型检查 + 产出）
+        run: pnpm run build

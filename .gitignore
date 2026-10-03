@@ -1,0 +1,25 @@
+# ios-dev-helper —— 本插件独立仓库的忽略规则
+
+# 依赖目录：本地安装，仓库里只提交 pnpm-lock.yaml
+node_modules/
+
+# macOS
+.DS_Store
+
+# 日志
+*.log
+
+# TypeScript 增量编译缓存
+*.tsbuildinfo
+
+# 插件自带工具在工作目录里产生的临时数据
+# （simulator_screenshot 的截图、derivedDataPath 的隔离构建沙箱等）
+.dsh/
+
+# ⚠️ 刻意【不】忽略 lib/ —— 它是本插件的运行入口，必须提交：
+#   1. package.json 的 main / exports 指向 ./lib/index.js；
+#   2. DSH 无法对 node_modules 里的 .ts 做类型剥离
+#      （ERR_UNSUPPORTED_NODE_MODULES_TYPE_STRIPPING），所以插件以 git 依赖方式
+#      安装后必须直接带上编译产物，否则装完加载不了；
+#   3. 后果：改完 src/ 必须运行 `pnpm run build`，并把 lib/ 一起提交。
+#      .github/workflows/ci.yml 会校验源码可编译，但不会替你提交产物。

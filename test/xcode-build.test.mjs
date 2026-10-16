@@ -152,3 +152,58 @@ test('truncation of a long log never splits a surrogate pair', async () => {
     }
   }
 });
+
+test('surfaces an upper-case xcodebuild warning instead of reporting a clean run', async () => {
+  // Verbatim from a real `xcodebuild clean` on this machine: xcodebuild writes its own
+  // diagnostics in upper case, and the parser used to match lowercase only. The tool
+  // therefore answered "0 warning(s)" for a run xcodebuild had warned about, and with
+  // treatWarningsAsErrors it passed as clean.
+  const cwd = makeWorkspace();
+  const { tool } = makeContext({
+    outputs: [
+      [
+        'xcodebuild',
+        {
+          text: '** CLEAN SUCCEEDED **\n',
+          stderr:
+            '--- xcodebuild: WARNING: Using the first of multiple matching destinations:\n' +
+            '{ platform:iOS Simulator, name:iPhone 17 Pro }\n' +
+            '{ platform:macOS, name:My Mac }\n',
+          code: 0,
+        },
+      ],
+    ],
+    config: { treatWarningsAsErrors: true },
+  });
+  const value = await tool('xcode_build').execute(
+    { action: 'clean', target: 'X.xcodeproj', scheme: 'S', cwd },
+    { signal: signal() },
+  );
+  assert.equal(value.warningCount, 1, 'the upper-case warning must be counted');
+  assert.equal(value.ok, false, 'treatWarningsAsErrors must fail a warned run');
+  assert.match(String(value.diagnostics), /Using the first of multiple matching destinations/);
+  assert.match(String(value.diagnostics), /^- xcodebuild: warning:/m, 'producer and severity are normalised');
+});
+
+test('still counts upper-case and lower-case severities the same way', async () => {
+  const cwd = makeWorkspace();
+  const { tool } = makeContext({
+    outputs: [
+      [
+        'xcodebuild',
+        {
+          text: '/src/A.swift:1:2: ERROR: upper case error\n** BUILD FAILED **\n',
+          code: 65,
+        },
+      ],
+    ],
+    config: { treatWarningsAsErrors: true },
+  });
+  const value = await tool('xcode_build').execute(
+    { target: 'X.xcodeproj', scheme: 'S', cwd },
+    { signal: signal() },
+  );
+  assert.equal(value.errorCount, 1);
+  assert.equal(value.ok, false);
+  assert.match(String(value.diagnostics), /^- \/src\/A\.swift:1:2: error: upper case error$/m);
+});

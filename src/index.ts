@@ -564,14 +564,21 @@ function outlivedBudget(result: CommandResult): boolean {
 //   /abs/path/File.swift:12:5: error: cannot find 'foo' in scope
 //   /abs/path/File.swift:12: error: ...
 //   <unknown>:0: error: ...            (no usable path)
-const DIAGNOSTIC_PATTERN = /^(.*?):(\d+)(?::(\d+))?:\s*(error|warning|note):\s*(.*)$/;
+// Case-insensitive on purpose: the compilers write lowercase `error:`/`warning:`,
+// but `xcodebuild` writes its own diagnostics in uppercase
+// (`--- xcodebuild: WARNING: Using the first of multiple matching destinations:`).
+// Case-sensitive matching dropped those, so a run xcodebuild had warned about was
+// reported as "0 warning(s)" — and with `treatWarningsAsErrors` it passed as clean.
+const DIAGNOSTIC_PATTERN = /^(.*?):(\d+)(?::(\d+))?:\s*(error|warning|note):\s*(.*)$/i;
 // `xcodebuild` also reports failures that carry no file/line at all, and those
 // are exactly the ones a caller most needs (a missing scheme, an unmatched
 // destination). Without these fallbacks a failed build reported "0 errors".
 //   xcodebuild: error: The project named "X" does not contain a scheme named "Y"
 //   error: something went wrong
-const TOOL_DIAGNOSTIC_PATTERN = /^([^\s:][^:]*?):\s*(error|warning):\s*(.*)$/;
-const BARE_DIAGNOSTIC_PATTERN = /^(error|warning):\s*(.*)$/;
+// `-{2,}\s*` absorbs the decoration xcodebuild puts before its own name, so the
+// producer is reported as `xcodebuild` rather than `--- xcodebuild`.
+const TOOL_DIAGNOSTIC_PATTERN = /^(?:-{2,}\s*)?([^\s:][^:]*?):\s*(error|warning):\s*(.*)$/i;
+const BARE_DIAGNOSTIC_PATTERN = /^(error|warning):\s*(.*)$/i;
 const TARGET_HEADER_PATTERN = /^===\s*(.+?)\s*===$/;
 
 /**
@@ -609,7 +616,7 @@ function parseDiagnostics(
       file = locatedFile.trim();
       lineNumber = Number(locatedLine);
       column = locatedColumn !== undefined ? Number(locatedColumn) : undefined;
-      severity = locatedSeverity;
+      severity = locatedSeverity.toLowerCase();
       message = locatedMessage;
     } else {
       const bare = BARE_DIAGNOSTIC_PATTERN.exec(line);
@@ -618,7 +625,7 @@ function parseDiagnostics(
       if (match === null) continue;
       // For `xcodebuild: error: ...` the leading token names the producer.
       file = bare !== null ? 'xcodebuild' : (match[1] ?? 'xcodebuild').trim();
-      severity = match[bare !== null ? 1 : 2] ?? '';
+      severity = (match[bare !== null ? 1 : 2] ?? '').toLowerCase();
       message = match[bare !== null ? 2 : 3] ?? '';
     }
 
@@ -770,8 +777,17 @@ export function buildXcodeInvocation(input: XcodeInvocationInput): XcodeInvocati
   if (scheme !== undefined) argv.push('-scheme', scheme);
   if (configuration !== undefined) argv.push('-configuration', configuration);
 
+  const callerRequestedSimulator = isNonEmptyString(args.simulator);
   let destination = isNonEmptyString(args.destination) ? args.destination.trim() : undefined;
-  const needsDestination = action !== 'clean' && action !== 'build-for-testing';
+  // A destination is *composed* only for actions that need one, but a destination the
+  // caller asked for (or a named simulator) is honoured for every action. Omitting it
+  // makes xcodebuild guess — it says so itself:
+  //   "--- xcodebuild: WARNING: Using the first of multiple matching destinations:"
+  // — and for `clean` a wrong guess can clean another destination's products.
+  const needsDestination =
+    action !== 'clean' && action !== 'build-for-testing'
+      ? true
+      : destination !== undefined || callerRequestedSimulator;
   if (destination === undefined && needsDestination) {
     const simulator = isNonEmptyString(args.simulator) ? args.simulator.trim() : undefined;
     const os = isNonEmptyString(args.os) ? args.os.trim() : undefined;

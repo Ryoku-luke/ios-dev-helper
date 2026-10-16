@@ -69,6 +69,25 @@ tools actually ask the outside world to do.
 
 `pnpm test` runs the same thing, and CI runs it after the build.
 
+### Real-environment integration test
+
+`test/integration.test.mjs` is opt-in and skipped by default (CI has no Xcode or
+simulator). It builds a real workspace with `xcodebuild`, installs and launches the
+product on a real simulator, and — the check that matters — **cross-checks the plugin's
+diagnostic counts against the raw log it was shown**, which is how a parser that drops
+a real warning gets caught instead of reporting a clean run.
+
+```sh
+IOS_HELPER_INTEGRATION=1 \
+IOS_HELPER_INTEGRATION_ROOT=/path/to/project \
+IOS_HELPER_INTEGRATION_SIMULATOR='iPhone 17 Pro' \
+IOS_HELPER_INTEGRATION_BUNDLE_ID=com.example.app \
+  node --test test/integration.test.mjs
+```
+
+It supplies its own real `subprocess` implementation (`test/support/real-subprocess.mjs`),
+since a standalone Node process cannot borrow the harness's service.
+
 ## Which version is loaded?
 
 The version from `package.json` is stamped into **every tool description** (as a
@@ -93,6 +112,12 @@ Runs `xcodebuild` and parses its diagnostics into bullets: `error`/`warning`
 lines that carry a position become `file:line:col: severity: message`, and
 `xcodebuild`-level failures with no position (a missing scheme, an unmatched
 destination) become `<producer>: severity: message`.
+
+Severity matching is **case-insensitive** on purpose. The compilers write lowercase
+`error:`/`warning:`, but `xcodebuild` writes its own diagnostics in upper case —
+`--- xcodebuild: WARNING: Using the first of multiple matching destinations:` — and
+matching only lowercase silently reported a run it had warned about as
+`0 warning(s)`, which `treatWarningsAsErrors` then passed as clean.
 
 - Auto-discovers the `.xcworkspace`/`.xcodeproj` and the scheme in the working
   directory. With several schemes it picks the one named after the project or
@@ -127,7 +152,10 @@ destination) become `<producer>: severity: message`.
   - On a non-test action the flag is ignored by `xcodebuild`, so the tool adds a
     note saying so rather than implying the run was filtered.
 - Composes a `-destination` from `simulator` + `os` when `destination` is
-  omitted, e.g. `simulator: "iPhone 17 Pro"`, `os: "26.5"`.
+  omitted, e.g. `simulator: "iPhone 17 Pro"`, `os: "26.5"`. A destination you ask
+  for (or a named `simulator`) is honoured for **every** action, including `clean`
+  and `build-for-testing`, which otherwise run with none — and then `xcodebuild`
+  guesses a destination, says so itself, and can clean another destination's products.
 - Marks the build not-ok when `warningCount > 0` **and** `treatWarningsAsErrors`
   is on, mirroring this repository's `Tools/run_tests.sh` rule that compiler
   warnings are failures.

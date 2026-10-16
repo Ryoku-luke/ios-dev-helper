@@ -31,7 +31,7 @@ function handleFor(spec, output) {
   return {
     collected: {
       stdout: { readFrom: () => ({ text, nextOffset: text.length, lossy: false }) },
-      stderr: { readFrom: () => ({ text: '', nextOffset: 0, lossy: false }) },
+      stderr: { readFrom: () => ({ text: output?.stderr ?? '', nextOffset: 0, lossy: false }) },
     },
     done,
     terminate() {},
@@ -42,7 +42,7 @@ function handleFor(spec, output) {
 /**
  * Load the plugin against a stubbed context.
  *
- * @param options.outputs `[needle, { text, code, signal }]` pairs; the first whose
+ * @param options.outputs `[needle, { text, stderr, code, signal }]` pairs; the first whose
  *   needle appears in the command line answers it. Order matters.
  * @param options.config Plugin config overrides.
  * @param options.spawn Custom spawn implementation (used by cancellation tests).

@@ -75,12 +75,26 @@ test('composes a destination from simulator + os, and lets `destination` win', (
   assert.equal(explicit.destination, 'generic/platform=iOS');
 });
 
-test('omits the destination for actions that take none', () => {
+test('does not invent a destination for actions that take none', () => {
   for (const action of ['clean', 'build-for-testing']) {
-    const result = invoke({ action, args: { simulator: 'iPhone 17 Pro' } });
+    const result = invoke({ action });
     assert.ok(!('error' in result));
     assert.equal(result.destination, undefined, action);
   }
+});
+
+test('honours an explicitly requested destination even for clean', () => {
+  // Without a destination xcodebuild guesses and says so itself ("WARNING: Using the
+  // first of multiple matching destinations"), and for `clean` a wrong guess can clean
+  // another destination's products. A caller who named a simulator gets it honoured.
+  const named = invoke({ action: 'clean', args: { simulator: 'iPhone 17 Pro', os: '26.5' } });
+  assert.ok(!('error' in named));
+  assert.equal(named.destination, 'platform=iOS Simulator,name=iPhone 17 Pro,OS=26.5');
+  assert.ok(named.argv.join(' ').includes('-destination'));
+
+  const explicit = invoke({ action: 'clean', args: { destination: 'generic/platform=iOS' } });
+  assert.ok(!('error' in explicit));
+  assert.equal(explicit.destination, 'generic/platform=iOS');
 });
 
 test('appends -only-testing:<id> and trims/deduplicates the list', () => {

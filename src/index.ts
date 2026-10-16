@@ -233,8 +233,35 @@ const DEFAULT_CONFIG: HelperConfig = {
   treatWarningsAsErrors: true,
 };
 
+/**
+ * This plugin's own version, read from its `package.json` so the two can never drift.
+ *
+ * It is stamped into every tool description and into the guidance heading so "which
+ * build is the running Host actually holding?" is answerable from the outside: a
+ * plugin loaded from a cached module keeps serving its old schemas, and without a
+ * stamp that is indistinguishable from a successful reload (learned the hard way —
+ * a stale Host had to be identified by diffing a field description).
+ */
+function readPluginVersion(): string {
+  try {
+    const raw = readFileSync(new URL('../package.json', import.meta.url), 'utf8');
+    const parsed: unknown = JSON.parse(raw);
+    const version =
+      parsed !== null && typeof parsed === 'object'
+        ? (parsed as { version?: unknown }).version
+        : undefined;
+    return isNonEmptyString(version) ? version.trim() : 'unknown';
+  } catch {
+    return 'unknown';
+  }
+}
+
+/** The version marker appended to every tool description. */
+const PLUGIN_VERSION = readPluginVersion();
+const VERSION_STAMP = `[ios-dev-helper v${PLUGIN_VERSION}]`;
+
 /** Payload of the SwiftUI/HIG system-prompt section owned by this plugin. */
-const SWIFTUI_GUIDANCE = `## iOS development conventions (ios-dev-helper)
+const SWIFTUI_GUIDANCE = `## iOS development conventions (ios-dev-helper v${PLUGIN_VERSION})
 
 When you write or modify UI code for an Apple platform in this session:
 
@@ -1571,9 +1598,23 @@ export function apply(ctx: Ctx, rawConfig?: unknown): () => void {
   const config = resolveConfig(rawConfig);
   const disposers: Array<() => void> = [];
 
-  /** Register one tool definition, keeping its disposer for teardown. */
+  /**
+   * Register one tool definition, keeping its disposer for teardown.
+   *
+   * Every description gets the version stamp here rather than at each call site, so
+   * a tool added later cannot forget it: the stamp is what makes a stale Host
+   * (serving a cached module) distinguishable from a reloaded one.
+   */
   const register = (definition: Record<string, unknown>): void => {
-    disposers.push(ctx.tools.register(definition));
+    const description = typeof definition.description === 'string' ? definition.description : '';
+    disposers.push(
+      ctx.tools.register({
+        ...definition,
+        description: description.includes(VERSION_STAMP)
+          ? description
+          : `${description} ${VERSION_STAMP}`.trim(),
+      }),
+    );
   };
 
   /**

@@ -46,12 +46,14 @@ function handleFor(spec, output) {
  *   needle appears in the command line answers it. Order matters.
  * @param options.config Plugin config overrides.
  * @param options.spawn Custom spawn implementation (used by cancellation tests).
- * @returns The tool registry, the recorded command lines and the spawned signals.
+ * @returns The tool registry, the recorded command lines, the spawned signals and the
+ *   registered system-prompt section (see `sectionOf`).
  */
 export function makeContext({ outputs = [], config = {}, spawn } = {}) {
   const commands = [];
   const spawnedSignals = [];
   const registry = new Map();
+  let section;
 
   const defaultSpawn = (spec) => {
     const line = spec.argv.join(' ');
@@ -71,11 +73,22 @@ export function makeContext({ outputs = [], config = {}, spawn } = {}) {
       get: (name) => registry.get(name),
     },
     subprocess,
-    systemPrompt: { section: () => () => {}, getSectionOrder: () => 0 },
+    systemPrompt: {
+      section: (value) => {
+        section = value;
+        return () => {};
+      },
+      getSectionOrder: () => 0,
+    },
     get: (name) => (name === 'subprocess' ? subprocess : undefined),
   };
   plugin.apply(ctx, config);
-  return { registry, commands, spawnedSignals, tool: (name) => registry.get(name) };
+  return { registry, commands, spawnedSignals, section, tool: (name) => registry.get(name) };
+}
+
+/** The heading of the guidance section the plugin registered. */
+export function sectionHeading(section) {
+  return String(section?.text({ scope: undefined }) ?? '').split('\n')[0];
 }
 
 /** Render a tool result the way the model would receive it. */

@@ -69,6 +69,22 @@ tools actually ask the outside world to do.
 
 `pnpm test` runs the same thing, and CI runs it after the build.
 
+## Which version is loaded?
+
+The version from `package.json` is stamped into **every tool description** (as a
+trailing `[ios-dev-helper vX.Y.Z]`) and into the guidance heading. That matters
+because a Host keeps serving the module it imported at startup: a plugin whose
+`lib/index.js` was rebuilt on disk looks identical to one that was actually
+reloaded, so without a stamp the two are indistinguishable from the outside —
+which is exactly how a stale Host once had to be identified, by diffing a parameter
+description by hand.
+
+To check what is live, read any tool's description (for example through the Tool
+inspect provider, or in the tool list the model sees) and compare it with
+`package.json`. If they differ, the Host predates your change: restart DSH, since a
+host-side plugin module is cached for the process lifetime (`dsh-hmr` does not
+cover a `link:` dependency).
+
 ## Tools
 
 ### `xcode_build`

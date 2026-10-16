@@ -1,6 +1,6 @@
 {
   "name": "ios-dev-helper",
-  "version": "1.0.2",
+  "version": "1.0.3",
   "private": true,
   "type": "module",
   "description": "DeepSeek Harness plugin for iOS development: builds Xcode projects and parses compiler diagnostics, drives iOS Simulators (boot/install/launch/screenshot/logs/tap/accessibility), resolves CocoaPods and SwiftPM dependencies, and injects SwiftUI + Human Interface Guidelines guidance into the system prompt.",

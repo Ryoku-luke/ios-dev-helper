@@ -357,6 +357,11 @@ dsh plugin --profile "$DSH_PROFILE" install /path/to/Tools/ios-dev-helper
 
 ## Notes and limits
 
+- **Cancellation reaches the child**: the host's abort signal is forwarded to every
+  spawned command, so cancelling a tool call terminates what it started instead of
+  leaving a build, install or `log stream` running. A tool that has already been
+  cancelled may still spawn follow-up commands; those arrive pre-aborted and are
+  killed immediately, and `simulator_install_launch` never retries after a cancel.
 - **Sandbox**: these tools spawn processes with the harness process's own
   authority. They are not confined by the DSH *file* sandbox that governs the
   `bash` tool, so `xcodebuild` can reach `~/Library/Caches` and DerivedData. The

@@ -2111,7 +2111,7 @@ export function apply(ctx: Ctx, rawConfig?: unknown): () => void {
         return [textBlock(parts.join('\n\n'))];
       },
     },
-    async execute(args: Record<string, unknown>, _exec: ToolExecContext): Promise<Record<string, unknown>> {
+    async execute(args: Record<string, unknown>, exec: ToolExecContext): Promise<Record<string, unknown>> {
       const cwd = resolveCwd(config, args.cwd);
       const notes: string[] = [];
       const discovered = await discoverProject(ctx, config, cwd);
@@ -2119,6 +2119,7 @@ export function apply(ctx: Ctx, rawConfig?: unknown): () => void {
         argv: [config.xcrunPath, 'simctl', 'list', 'runtimes', '-j'],
         cwd,
         timeoutMs: config.simctlTimeoutMs,
+        ...(exec.signal !== undefined ? { signal: exec.signal } : {}),
       });
       const runtimeNames: string[] = [];
       const runtimesDocument = parseJsonObject(runtimes.output);
@@ -2445,12 +2446,17 @@ export function apply(ctx: Ctx, rawConfig?: unknown): () => void {
         return [textBlock(parts.join('\n\n'))];
       },
     },
-    async execute(args: Record<string, unknown>, _exec: ToolExecContext): Promise<Record<string, unknown>> {
+    async execute(args: Record<string, unknown>, exec: ToolExecContext): Promise<Record<string, unknown>> {
       const cwd = resolveCwd(config, args.cwd);
       const action = isNonEmptyString(args.action) ? args.action.trim() : 'list';
       const notes: string[] = [];
       const run = (argv: string[]): Promise<CommandResult> =>
-        runCommand(ctx, config, { argv: [config.xcrunPath, 'simctl', ...argv], cwd, timeoutMs: config.simctlTimeoutMs });
+        runCommand(ctx, config, {
+          argv: [config.xcrunPath, 'simctl', ...argv],
+          cwd,
+          timeoutMs: config.simctlTimeoutMs,
+          ...(exec.signal !== undefined ? { signal: exec.signal } : {}),
+        });
 
       // Validate before doing anything else: an unknown verb must not reach
       // `simctl`, whose reply would be a usage dump naming no culprit.
@@ -2530,6 +2536,7 @@ export function apply(ctx: Ctx, rawConfig?: unknown): () => void {
           argv: ['/usr/bin/open', '-a', 'Simulator'],
           cwd,
           timeoutMs: 30000,
+          ...(exec.signal !== undefined ? { signal: exec.signal } : {}),
         });
         if (opened.exitCode !== 0) notes.push(bounded(opened.output, 500).text);
         const ok = opened.exitCode === 0 && !bootFailed;
@@ -2641,7 +2648,7 @@ export function apply(ctx: Ctx, rawConfig?: unknown): () => void {
         return [textBlock(parts.join('\n\n'))];
       },
     },
-    async execute(args: Record<string, unknown>, _exec: ToolExecContext): Promise<Record<string, unknown>> {
+    async execute(args: Record<string, unknown>, exec: ToolExecContext): Promise<Record<string, unknown>> {
       const cwd = resolveCwd(config, args.cwd);
       const notes: string[] = [];
       if (!isNonEmptyString(args.app_path)) {
@@ -2665,6 +2672,7 @@ export function apply(ctx: Ctx, rawConfig?: unknown): () => void {
         argv: [config.xcrunPath, 'simctl', 'boot', udid],
         cwd,
         timeoutMs: config.simctlTimeoutMs,
+        ...(exec.signal !== undefined ? { signal: exec.signal } : {}),
       });
       if (booted.exitCode !== 0 && !/current state:\s*Booted/i.test(booted.output)) {
         notes.push(`boot reported: ${bounded(booted.output, 300).text}`);
@@ -2681,10 +2689,16 @@ export function apply(ctx: Ctx, rawConfig?: unknown): () => void {
         argv: installArgv,
         cwd,
         timeoutMs: config.simctlTimeoutMs,
+        ...(exec.signal !== undefined ? { signal: exec.signal } : {}),
       });
+      // Never retry after a cancellation: the signal is already aborted, so the
+      // second spawn would fail immediately and be reported as "could not be
+      // launched", blaming a missing CLI for the caller's own cancellation.
+      const callerAborted = exec.signal?.aborted === true;
       if (
         installed.exitCode !== 0 &&
         !installed.timedOut &&
+        !callerAborted &&
         FLAKY_SIMCTL_PATTERN.test(installed.output)
       ) {
         notes.push(
@@ -2696,6 +2710,7 @@ export function apply(ctx: Ctx, rawConfig?: unknown): () => void {
           argv: installArgv,
           cwd,
           timeoutMs: config.simctlTimeoutMs,
+          ...(exec.signal !== undefined ? { signal: exec.signal } : {}),
         });
       }
       const installSeconds = ((Date.now() - installStarted) / 1000).toFixed(1);
@@ -2745,6 +2760,7 @@ export function apply(ctx: Ctx, rawConfig?: unknown): () => void {
           argv: [config.xcrunPath, 'simctl', 'terminate', udid, bundleId],
           cwd,
           timeoutMs: config.simctlTimeoutMs,
+          ...(exec.signal !== undefined ? { signal: exec.signal } : {}),
         });
       }
 
@@ -2762,6 +2778,7 @@ export function apply(ctx: Ctx, rawConfig?: unknown): () => void {
         argv: launchArgv,
         cwd,
         timeoutMs: launchTimeoutMs,
+        ...(exec.signal !== undefined ? { signal: exec.signal } : {}),
       });
       const launchSeconds = ((Date.now() - launchStarted) / 1000).toFixed(1);
       const pidMatch = /:\s*(\d+)\s*$/.exec(launched.output.trim());
@@ -2864,7 +2881,7 @@ export function apply(ctx: Ctx, rawConfig?: unknown): () => void {
         return blocks;
       },
     },
-    async execute(args: Record<string, unknown>, _exec: ToolExecContext): Promise<Record<string, unknown>> {
+    async execute(args: Record<string, unknown>, exec: ToolExecContext): Promise<Record<string, unknown>> {
       const cwd = resolveCwd(config, args.cwd);
       const notes: string[] = [];
 
@@ -2885,6 +2902,7 @@ export function apply(ctx: Ctx, rawConfig?: unknown): () => void {
         path: isNonEmptyString(args.path) ? args.path.trim() : undefined,
         attach: args.attach !== false,
         notes,
+        ...(exec.signal !== undefined ? { signal: exec.signal } : {}),
       });
       if (!captured.ok) {
         return {
@@ -2970,7 +2988,7 @@ export function apply(ctx: Ctx, rawConfig?: unknown): () => void {
         return [textBlock(parts.join('\n\n'))];
       },
     },
-    async execute(args: Record<string, unknown>, _exec: ToolExecContext): Promise<Record<string, unknown>> {
+    async execute(args: Record<string, unknown>, exec: ToolExecContext): Promise<Record<string, unknown>> {
       const cwd = resolveCwd(config, args.cwd);
       const notes: string[] = [];
 
@@ -3006,6 +3024,7 @@ export function apply(ctx: Ctx, rawConfig?: unknown): () => void {
         ],
         cwd,
         timeoutMs: durationMs,
+        ...(exec.signal !== undefined ? { signal: exec.signal } : {}),
       });
 
       if (result.unavailable) {

@@ -5,11 +5,17 @@
  * every test drives it with a stubbed context: `makeContext()` records the exact
  * commands it was asked to run and answers each one from a canned list.
  */
-import { mkdirSync, mkdtempSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
 const plugin = await import(new URL('../../lib/index.js', import.meta.url));
+
+/** A real 1x1 PNG, so a stubbed screenshot leaves a file that attaching can read. */
+const TINY_PNG = Buffer.from(
+  'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNkYAAAAAYAAjCB0C8AAAAASUVORK5CYII=',
+  'base64',
+);
 
 /**
  * Create a scratch workspace. The `target` preflight requires the project to exist,
@@ -49,21 +55,47 @@ function handleFor(spec, output) {
  * @returns The tool registry, the recorded command lines, the spawned signals and the
  *   registered system-prompt section (see `sectionOf`).
  */
-export function makeContext({ outputs = [], config = {}, spawn } = {}) {
+export function makeContext({ outputs = [], config = {}, spawn, attachments: wantAttachments = false } = {}) {
   const commands = [];
   const spawnedSignals = [];
   const registry = new Map();
   let section;
+  const savedImages = [];
 
   const defaultSpawn = (spec) => {
     const line = spec.argv.join(' ');
     commands.push(line);
     spawnedSignals.push(spec.signal);
+    // A screenshot really writes a file: the plugin reads it back to attach it.
+    if (line.includes('simctl io') && line.includes('screenshot')) {
+      try {
+        writeFileSync(spec.argv[spec.argv.length - 1], TINY_PNG);
+      } catch {
+        /* the plugin reports the failure itself */
+      }
+    }
     const match = outputs.find(([needle]) => line.includes(needle));
     return handleFor(spec, match === undefined ? {} : match[1]);
   };
 
   const subprocess = { spawn: spawn ?? defaultSpawn };
+  const attachments = wantAttachments
+    ? {
+        imageLimits: {},
+        async saveImage(input) {
+          const bytes = input?.data?.length ?? 0;
+          savedImages.push({ name: input?.name, mediaType: input?.mediaType, bytes });
+          return {
+            attachmentId: 'att-1',
+            mediaType: input?.mediaType ?? 'image/png',
+            bytes,
+            width: 402,
+            height: 874,
+            ...(typeof input?.name === 'string' ? { name: input.name } : {}),
+          };
+        },
+      }
+    : undefined;
   const ctx = {
     tools: {
       register: (definition) => {
@@ -80,10 +112,12 @@ export function makeContext({ outputs = [], config = {}, spawn } = {}) {
       },
       getSectionOrder: () => 0,
     },
-    get: (name) => (name === 'subprocess' ? subprocess : undefined),
+    ...(attachments !== undefined ? { attachments } : {}),
+    get: (name) =>
+      name === 'subprocess' ? subprocess : name === 'attachments' ? attachments : undefined,
   };
   plugin.apply(ctx, config);
-  return { registry, commands, spawnedSignals, section, tool: (name) => registry.get(name) };
+  return { registry, commands, spawnedSignals, section, savedImages, tool: (name) => registry.get(name) };
 }
 
 /** The heading of the guidance section the plugin registered. */

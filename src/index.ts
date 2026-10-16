@@ -3387,6 +3387,265 @@ export function apply(ctx: Ctx, rawConfig?: unknown): () => void {
     },
   });
 
+  // ---------------------------------------------------------------------------
+  // Capability: acceptance-criteria UI verification
+  // ---------------------------------------------------------------------------
+
+  register({
+    name: 'ios_verify_ui',
+    description:
+      'Check the simulator screen against a plain-language acceptance criterion, e.g. ' +
+      '"屏幕上应该出现日历和日期选择器". A tool cannot see, so this is a two-phase protocol: ' +
+      'phase 1 captures the screen, attaches it to this conversation and hands back the criterion ' +
+      'for you — the vision-capable model — to judge; phase 2 records that judgement by calling this ' +
+      'tool again with `passed` (and `reason` when it failed), answering `{ passed: true }` or ' +
+      '`{ passed: false, reason, nextSteps }`. Do both phases: a capture nobody judged verifies ' +
+      'nothing. `ok` is false whenever the criterion is not met or the check could not run at all — ' +
+      '`status` says which (`failed`, `capture-failed`, `no-device`, `invalid-arguments`).',
+    // A capture and the verdict on it have to belong to one sequence: two verification
+    // runs racing would each attach their own frame and the verdicts could be swapped.
+    isConcurrencySafe: () => false,
+    timeoutMs: config.simctlTimeoutMs + 30000,
+    parameters: {
+      type: 'object',
+      properties: {
+        acceptance_criteria: {
+          type: 'string',
+          description:
+            'What the screen must show, in plain language, e.g. "屏幕上应该出现日历和日期选择器". ' +
+            'Required in both phases so the verdict always carries the criterion it judged.',
+        },
+        passed: {
+          type: 'boolean',
+          description:
+            'Phase 2 only: your verdict after looking at the attached screenshot. Omit it entirely in ' +
+            'phase 1 — passing it means "record this judgement".',
+        },
+        reason: {
+          type: 'string',
+          description:
+            'Required when `passed` is false: what is missing or wrong, e.g. "未发现日期选择器" — ' +
+            'and say what the screen showed instead, so the caller can act on it.',
+        },
+        device: {
+          type: 'string',
+          description: 'Simulator name, UDID, or `booted`. Defaults to the booted device.',
+        },
+        path: {
+          type: 'string',
+          description:
+            'Phase 1 only: explicit screenshot destination, absolute or relative to `cwd`. Defaults to ' +
+            '`<cwd>/<screenshotDir>/verify-<timestamp>.png`, so a verification is never overwritten by ' +
+            'the next one.',
+        },
+        cwd: {
+          type: 'string',
+          description: 'Directory to run in. Defaults to the plugin working directory.',
+        },
+        attach: {
+          type: 'boolean',
+          description:
+            'Phase 1 only: attach the capture so it can be judged. Defaults to true; when attaching is ' +
+            'impossible the returned path can be read with the read_image tool instead.',
+        },
+      },
+      required: ['acceptance_criteria'],
+    },
+    output: {
+      schema: {
+        type: 'object',
+        additionalProperties: false,
+        required: ['ok', 'summary', 'notes'],
+        properties: {
+          ok: { type: 'boolean' },
+          summary: { type: 'string' },
+          // Absent in phase 1: the verdict does not exist until the model has looked.
+          passed: { type: 'boolean' },
+          reason: { type: 'string' },
+          status: {
+            type: 'string',
+            enum: [
+              'awaiting_vision_judgement',
+              'passed',
+              'failed',
+              'capture-failed',
+              'no-device',
+              'invalid-arguments',
+            ],
+          },
+          acceptanceCriteria: { type: 'string' },
+          screenshotPath: { type: 'string' },
+          udid: { type: 'string' },
+          attached: { type: 'boolean' },
+          instructions: { type: 'string' },
+          nextSteps: { type: 'array', items: { type: 'string' } },
+          exitCode: { type: 'integer' },
+          image: IMAGE_REF_SCHEMA,
+          notes: { type: 'array', items: { type: 'string' } },
+        },
+      },
+      render(
+        _args: unknown,
+        value: {
+          summary: string;
+          reason?: string;
+          instructions?: string;
+          nextSteps?: unknown;
+          image?: unknown;
+          notes?: unknown;
+        },
+      ): unknown[] {
+        const notes = Array.isArray(value.notes) ? value.notes.filter(isNonEmptyString) : [];
+        const nextSteps = Array.isArray(value.nextSteps) ? value.nextSteps.filter(isNonEmptyString) : [];
+        const parts = [
+          value.summary,
+          isNonEmptyString(value.reason) ? `reason: ${value.reason}` : undefined,
+          isNonEmptyString(value.instructions) ? value.instructions : undefined,
+          nextSteps.length > 0 ? `Next steps:\n${nextSteps.map((step) => `- ${step}`).join('\n')}` : undefined,
+          notes.length > 0 ? `Notes:\n${notes.map((note) => `- ${note}`).join('\n')}` : undefined,
+        ].filter(isNonEmptyString);
+        const blocks: unknown[] = [textBlock(parts.join('\n\n'))];
+        // The ImageBlock is what lets the model actually look at the screen.
+        if (value.image !== undefined) blocks.push({ type: 'image', attachment: value.image });
+        return blocks;
+      },
+    },
+    async execute(args: Record<string, unknown>, exec: ToolExecContext): Promise<Record<string, unknown>> {
+      const cwd = resolveCwd(config, args.cwd);
+      const notes: string[] = [];
+      const criteria = isNonEmptyString(args.acceptance_criteria)
+        ? args.acceptance_criteria.trim()
+        : undefined;
+      if (criteria === undefined) {
+        return {
+          ok: false,
+          status: 'invalid-arguments',
+          summary:
+            '`acceptance_criteria` is required: say what the screen must show, e.g. ' +
+            '"屏幕上应该出现日历和日期选择器"',
+          notes,
+        };
+      }
+
+      // ---- Phase 2: record the judgement the model made from the capture --------
+      if (typeof args.passed === 'boolean') {
+        const reason = isNonEmptyString(args.reason) ? args.reason.trim() : undefined;
+        if (args.passed) {
+          return {
+            ok: true,
+            passed: true,
+            status: 'passed',
+            acceptanceCriteria: criteria,
+            summary: `acceptance criteria met: ${criteria}`,
+            ...(isNonEmptyString(args.path) ? { screenshotPath: args.path.trim() } : {}),
+            notes,
+          };
+        }
+        if (reason === undefined) {
+          // A bare "it failed" is not actionable and cannot be audited later.
+          return {
+            ok: false,
+            passed: false,
+            status: 'invalid-arguments',
+            acceptanceCriteria: criteria,
+            summary:
+              'a failed verification must say what is wrong: call again with `reason`, e.g. ' +
+              '`reason: "未发现日期选择器"`, naming what the screen showed instead',
+            notes,
+          };
+        }
+        return {
+          ok: false,
+          passed: false,
+          status: 'failed',
+          reason,
+          acceptanceCriteria: criteria,
+          summary:
+            `acceptance criteria NOT met: ${criteria}\n` +
+            `reason: ${reason}\n` +
+            'Fix the UI or the flow, then build, relaunch and verify again.',
+          nextSteps: [
+            'list what the screen actually shows with `simulator_elements` to pin the gap down',
+            'if the screen was mid-navigation or still animating, let it settle and re-run phase 1 — ' +
+              'do not conclude from a capture taken too early',
+            'if the UI is genuinely missing or wrong, fix the SwiftUI code, then `xcode_build` and ' +
+              '`simulator_install_launch`, and only then verify again',
+            'if the criterion itself is not something a screenshot can show (a haptic, a sound, ' +
+              'a network effect), say so rather than reporting a UI failure',
+          ],
+          ...(isNonEmptyString(args.path) ? { screenshotPath: args.path.trim() } : {}),
+          notes,
+        };
+      }
+
+      // ---- Phase 1: capture and hand the criterion to the vision model ---------
+      const resolved = await resolveDevice(ctx, config, cwd, args.device, exec.signal);
+      if (resolved.udid === undefined) {
+        return {
+          ok: false,
+          status: 'no-device',
+          acceptanceCriteria: criteria,
+          summary: messageOr(
+            resolved.note,
+            'no booted simulator is available; install and launch the app with ' +
+              '`simulator_install_launch` first',
+          ),
+          notes,
+        };
+      }
+      const captured = await captureScreen({
+        cwd,
+        udid: resolved.udid,
+        // A distinct prefix keeps verification captures apart from the plain
+        // `simulator_screenshot` ones, so an acceptance run is easy to find later.
+        prefix: 'verify',
+        path: isNonEmptyString(args.path) ? args.path.trim() : undefined,
+        attach: args.attach !== false,
+        notes,
+        ...(exec.signal !== undefined ? { signal: exec.signal } : {}),
+      });
+      if (!captured.ok) {
+        return {
+          ok: false,
+          status: 'capture-failed',
+          acceptanceCriteria: criteria,
+          ...(captured.path !== undefined ? { screenshotPath: captured.path } : {}),
+          ...(captured.exitCode !== undefined ? { exitCode: captured.exitCode } : {}),
+          summary: `could not capture the screen: ${captured.failure}`,
+          notes,
+        };
+      }
+
+      const attached = captured.image !== undefined;
+      const where = attached ? 'attached screenshot' : `screenshot at ${captured.path}`;
+      if (!attached) {
+        notes.push(
+          'the capture could not be attached, so read the file at `screenshotPath` with the ' +
+            'read_image tool before judging it',
+        );
+      }
+      return {
+        ok: true,
+        status: 'awaiting_vision_judgement',
+        acceptanceCriteria: criteria,
+        screenshotPath: captured.path,
+        udid: resolved.udid,
+        attached,
+        ...(captured.image !== undefined ? { image: captured.image } : {}),
+        instructions:
+          `Look at the ${where} and decide whether it satisfies: "${criteria}". ` +
+          'Then call ios_verify_ui again with the same `acceptance_criteria` and either ' +
+          '`passed: true`, or `passed: false` with a `reason` naming what is missing. ' +
+          'Judge only what the picture shows — if the capture is ambiguous or clearly mid-animation, ' +
+          'capture again instead of guessing.',
+        summary:
+          `captured ${captured.path} (${String(captured.bytes)} bytes)` +
+          `${attached ? ', attached for judging' : ''}; the criterion under test is: ${criteria}`,
+        notes,
+      };
+    },
+  });
+
   register({
     name: 'simulator_elements',
     description:

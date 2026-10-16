@@ -267,6 +267,39 @@ the PNG, so it can be inspected with the `read_image` tool.
   failure if no readable image landed, and it says so plainly when no simulator is
   booted.
 
+### `ios_verify_ui`
+
+Checks the screen against a plain-language acceptance criterion, e.g.
+`"屏幕上应该出现日历和日期选择器"`.
+
+**A tool cannot see**, so this is deliberately a two-phase protocol rather than one
+magic call:
+
+1. **Phase 1** — call it with `acceptance_criteria` only. It captures the screen
+   (`<cwd>/<screenshotDir>/verify-<UTC timestamp>.png`, attached as an `ImageBlock`
+   like `simulator_screenshot` does) and returns the criterion, the path and
+   instructions telling the vision-capable model to judge it. It never invents a
+   verdict.
+2. **Phase 2** — call it again with the same `acceptance_criteria` plus `passed`
+   (and, when it failed, `reason`). The answer is `{ passed: true }`, or
+   `{ passed: false, reason, nextSteps }` with concrete remediation: inspect what is
+   actually on screen with `simulator_elements`, re-capture if the frame was
+   mid-animation, and — when the UI is genuinely missing — fix the SwiftUI code, then
+   `xcode_build`, `simulator_install_launch` and verify again.
+
+`ok` is false whenever the criterion is **not met** or the check could not run;
+`status` disambiguates (`failed`, `capture-failed`, `no-device`,
+`invalid-arguments`, or `awaiting_vision_judgement` in phase 1). A `passed: false`
+without a `reason` is refused: an unexplained failure cannot be fixed, and cannot be
+audited later.
+
+**Why not one call that returns the verdict?** Doing that would mean the plugin
+answering with its own model call (`ctx.get('llm')` → `prepareCall` → `stream`, checking
+`inputModalities` for `image`). That is possible, but it spends another billed,
+credentialed request per verification to duplicate a judgement the calling model is
+already making — and it silently changes whose opinion the verdict is. Say the word if
+you want that variant.
+
 ### `simulator_logs`
 
 Listens to the booted simulator's unified log with

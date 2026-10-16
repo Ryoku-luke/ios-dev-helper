@@ -47,6 +47,28 @@ npm run build      # tsc -p tsconfig.json  ->  lib/index.js + lib/types/
 `typescript` and `@types/node` are `devDependencies`; nothing at runtime needs
 them, so the installed plugin stays dependency-free.
 
+## Tests
+
+```sh
+npm test           # compiles, then runs node --test test/*.test.mjs
+```
+
+The suite needs no test framework and no network: it drives the plugin against a
+stubbed `subprocess` service (`test/support/harness.mjs`) and asserts what the
+tools actually ask the outside world to do.
+
+- `test/xcode-invocation.test.mjs` unit-tests the pure `buildXcodeInvocation`,
+  which is why that function is exported: the exact argument vector, the
+  DerivedData precedence and the `onlyTesting` validation are asserted directly,
+  with no process and no stub.
+- `test/xcode-build.test.mjs` covers the tool: the target preflight, diagnostic
+  capping and counting, the write-permission cause, budget outcomes and truncation
+  safety.
+- `test/simulator-tools.test.mjs` covers simulator input validation, the install
+  retry/timeout policy, and that host cancellation reaches every spawned command.
+
+`pnpm test` runs the same thing, and CI runs it after the build.
+
 ## Tools
 
 ### `xcode_build`

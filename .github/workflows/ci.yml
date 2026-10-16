@@ -53,3 +53,7 @@ jobs:
       # 所以不需要任何 `|| exit 1` 兜底，编译失败 CI 必然报错。
       - name: pnpm run build（类型检查 + 产出）
         run: pnpm run build
+      # 行为测试：驱动工具跑在打桩的 subprocess 上，断言它请求的命令、拒绝的输入，
+      # 以及宿主取消是否真的到达子进程。test 脚本自带一次编译。
+      - name: pnpm test（行为测试）
+        run: pnpm test

@@ -678,10 +678,137 @@ function formatDiagnostics(diagnostics: Diagnostic[]): string {
  * @param cwd Directory to look for an `.xcworkspace`/`.xcodeproj` in.
  * @returns The chosen target, its schemes, any tool-level diagnostic, and a log line when nothing was found.
  */
+/** Everything `buildXcodeInvocation` needs; `target` and `scheme` are already resolved. */
+interface XcodeInvocationInput {
+  args: Record<string, unknown>;
+  config: HelperConfig;
+  cwd: string;
+  action: string;
+  target: string;
+  scheme: string | undefined;
+}
+
+/** An assembled `xcodebuild` command line, or the reason it could not be assembled. */
+type XcodeInvocation =
+  | { argv: string[]; notes: string[]; destination?: string; derivedDataPath?: string }
+  | { error: string };
+
+/**
+ * Assemble the `xcodebuild` argument vector for one call.
+ *
+ * Deliberately pure: it spawns nothing, reads no filesystem and mutates no state, so
+ * the exact command a call will run — and the notes explaining it — can be asserted
+ * directly in tests. Everything side-effecting (project discovery, the target
+ * preflight, the optional `simctl shutdown all`) stays with the caller.
+ *
+ * @param input Resolved `action`, `target` and `scheme`, the raw `args` for the
+ *   remaining switches, the plugin config and the working directory.
+ * @returns `{ argv, notes, destination, derivedDataPath }` on success, or
+ *   `{ error }` when an argument is malformed (`onlyTesting`).
+ */
+export function buildXcodeInvocation(input: XcodeInvocationInput): XcodeInvocation {
+  const { args, config, cwd, action, target, scheme } = input;
+  const notes: string[] = [];
+  const flag = target.endsWith('.xcworkspace') ? '-workspace' : '-project';
+  // Only an explicit request is forwarded: passing a default would override a
+  // scheme's own build configuration, which is not this tool's decision.
+  const configuration = isNonEmptyString(args.configuration) ? args.configuration.trim() : undefined;
+
+  // `onlyTesting` constrains a test action to specific identifiers. The earlier
+  // `only_testing` spelling stays accepted so an existing caller does not break, but
+  // the camelCase name is the documented one.
+  const rawOnlyTesting = args.onlyTesting ?? args.only_testing;
+  let onlyTesting: string[] = [];
+  if (rawOnlyTesting !== undefined) {
+    if (!Array.isArray(rawOnlyTesting)) {
+      return {
+        error: '`onlyTesting` must be an array of test identifiers, e.g. ["LunisolarCalendarUITests"]',
+      };
+    }
+    const malformed = rawOnlyTesting.filter((entry) => !isNonEmptyString(entry)).length;
+    if (malformed > 0) {
+      return {
+        error:
+          `every \`onlyTesting\` entry must be a non-empty string; ` +
+          `${malformed} entr${malformed === 1 ? 'y is' : 'ies are'} not`,
+      };
+    }
+    onlyTesting = [...new Set(rawOnlyTesting.map((entry) => (entry as string).trim()))];
+    if (onlyTesting.length === 0) {
+      return { error: '`onlyTesting` was empty; list at least one test identifier, or omit the argument' };
+    }
+  }
+
+  const argv: string[] = [config.xcodebuildPath, action, flag, target];
+  if (scheme !== undefined) argv.push('-scheme', scheme);
+  if (configuration !== undefined) argv.push('-configuration', configuration);
+
+  let destination = isNonEmptyString(args.destination) ? args.destination.trim() : undefined;
+  const needsDestination = action !== 'clean' && action !== 'build-for-testing';
+  if (destination === undefined && needsDestination) {
+    const simulator = isNonEmptyString(args.simulator) ? args.simulator.trim() : undefined;
+    const os = isNonEmptyString(args.os) ? args.os.trim() : undefined;
+    if (simulator !== undefined) {
+      destination =
+        os !== undefined
+          ? `platform=iOS Simulator,name=${simulator},OS=${os}`
+          : `platform=iOS Simulator,name=${simulator}`;
+    }
+  }
+  if (destination !== undefined) argv.push('-destination', destination);
+
+  // `xcodebuild` accepts both `-only-testing <id>` and `-only-testing:<id>`; the joined
+  // form is the one this repository's Tools/run_tests.sh uses.
+  for (const identifier of onlyTesting) argv.push(`-only-testing:${identifier}`);
+  if (onlyTesting.length > 0 && !TEST_ACTIONS.has(action)) {
+    notes.push(`\`onlyTesting\` only constrains test actions; the \`${action}\` action ignores it`);
+  }
+
+  // DerivedData decides whether repeat builds are incremental. Precedence: the
+  // per-call argument, then the configured path, then the built-in default — and the
+  // result is applied unconditionally. Gating the default on the directory already
+  // existing (the earlier behaviour) made it unreachable: nothing else creates
+  // `<cwd>/.dsh/DerivedData`, so the default could never bootstrap itself and every
+  // build kept writing to the shared ~/Library DerivedData. The price of applying it
+  // is one full rebuild the first time a workspace switches location; `xcodebuild`
+  // creates the directory itself.
+  //
+  // The path is a single argv element: no shell parses this command, so quoting it
+  // (`-derivedDataPath "<path>"`) would literally embed quotes in the path.
+  const requestedDerivedData = isNonEmptyString(args.derived_data_path)
+    ? args.derived_data_path.trim()
+    : config.derivedDataPath;
+  const derivedDataIsExplicit =
+    isNonEmptyString(args.derived_data_path) || config.derivedDataPathConfigured;
+  const derivedDataPath =
+    requestedDerivedData.length === 0
+      ? undefined
+      : isAbsolute(requestedDerivedData)
+        ? requestedDerivedData
+        : join(cwd, requestedDerivedData);
+  if (derivedDataPath !== undefined) {
+    notes.push(
+      derivedDataIsExplicit
+        ? `using the configured DerivedData path: ${derivedDataPath}`
+        : `using the workspace DerivedData path (default) for incremental builds: ${derivedDataPath}`,
+    );
+    argv.push('-derivedDataPath', derivedDataPath);
+  }
+
+  if (Array.isArray(args.extra_args)) {
+    for (const entry of args.extra_args) {
+      if (isNonEmptyString(entry)) argv.push(entry);
+    }
+  }
+
+  return { argv, notes, destination, derivedDataPath };
+}
+
 async function discoverProject(
   ctx: Ctx,
   config: HelperConfig,
   cwd: string,
+  signal?: AbortSignal,
 ): Promise<{
   target?: string;
   schemes: string[];
@@ -697,6 +824,7 @@ async function discoverProject(
     argv: ['/bin/sh', '-c', 'ls -1d *.xcworkspace *.xcodeproj 2>/dev/null'],
     cwd,
     timeoutMs: 15000,
+    ...(signal !== undefined ? { signal } : {}),
   });
   if (probe.unavailable) return { schemes: [], diagnostics: '', detectionLog: probe.output };
 
@@ -715,6 +843,7 @@ async function discoverProject(
     argv: [config.xcodebuildPath, '-list', flag, target, '-json'],
     cwd,
     timeoutMs: 120000,
+    ...(signal !== undefined ? { signal } : {}),
   });
 
   let schemes: string[] = [];
@@ -898,11 +1027,17 @@ function formatDevices(document: Record<string, any>, runtimeFilter?: string): s
  * @param cwd Directory to run the query in.
  * @returns Names of currently booted simulators (empty when none, or when the list is unreadable).
  */
-async function bootedSimulatorNames(ctx: Ctx, config: HelperConfig, cwd: string): Promise<string[]> {
+async function bootedSimulatorNames(
+  ctx: Ctx,
+  config: HelperConfig,
+  cwd: string,
+  signal?: AbortSignal,
+): Promise<string[]> {
   const listed = await runCommand(ctx, config, {
     argv: [config.xcrunPath, 'simctl', 'list', 'devices', 'booted', '-j'],
     cwd,
     timeoutMs: config.simctlTimeoutMs,
+    ...(signal !== undefined ? { signal } : {}),
   });
   const document = parseJsonObject(listed.output);
   if (document === undefined) return [];
@@ -925,12 +1060,14 @@ async function resolveDevice(
   config: HelperConfig,
   cwd: string,
   requested: unknown,
+  signal?: AbortSignal,
 ): Promise<{ udid?: string; note?: string }> {
   if (!isNonEmptyString(requested)) {
     const booted = await runCommand(ctx, config, {
       argv: [config.xcrunPath, 'simctl', 'list', 'devices', 'booted', '-j'],
       cwd,
       timeoutMs: config.simctlTimeoutMs,
+      ...(signal !== undefined ? { signal } : {}),
     });
     const document = parseJsonObject(booted.output);
     if (document === undefined) {
@@ -953,6 +1090,7 @@ async function resolveDevice(
       argv: [config.xcrunPath, 'simctl', 'list', 'devices', '-j'],
       cwd,
       timeoutMs: config.simctlTimeoutMs,
+      ...(signal !== undefined ? { signal } : {}),
     });
     const document = parseJsonObject(known.output);
     if (document === undefined) return { udid: selector };
@@ -967,12 +1105,13 @@ async function resolveDevice(
             'devices, or pass a device name instead',
         };
   }
-  if (selector === 'booted') return resolveDevice(ctx, config, cwd, undefined);
+  if (selector === 'booted') return resolveDevice(ctx, config, cwd, undefined, signal);
 
   const listed = await runCommand(ctx, config, {
     argv: [config.xcrunPath, 'simctl', 'list', 'devices', 'available', '-j'],
     cwd,
     timeoutMs: config.simctlTimeoutMs,
+    ...(signal !== undefined ? { signal } : {}),
   });
   const document = parseJsonObject(listed.output);
   if (document === undefined) {
@@ -1753,7 +1892,7 @@ export function apply(ctx: Ctx, rawConfig?: unknown): () => void {
       }
 
       if (target === undefined || scheme === undefined) {
-        const discovered = await discoverProject(ctx, config, cwd);
+        const discovered = await discoverProject(ctx, config, cwd, exec.signal);
         if (discovered.detectionLog.length > 0) notes.push(discovered.detectionLog);
         if (target === undefined) {
           target = discovered.target;
@@ -1805,118 +1944,26 @@ export function apply(ctx: Ctx, rawConfig?: unknown): () => void {
       }
 
       const action = isNonEmptyString(args.action) ? args.action.trim() : 'build';
-      // `configuration` used to be computed and then never used: the parameter was
-      // documented and silently ignored, so `configuration: 'Release'` built Debug.
-      // Only an explicit request is forwarded — passing a default would override a
-      // scheme's own build configuration, which is not this tool's decision.
-      const configuration = isNonEmptyString(args.configuration) ? args.configuration.trim() : undefined;
-      const flag = target.endsWith('.xcworkspace') ? '-workspace' : '-project';
 
-      // `onlyTesting` constrains a test action to specific identifiers. The
-      // earlier `only_testing` spelling stays accepted so an existing caller does
-      // not break, but the camelCase name is the documented one.
-      const rawOnlyTesting = args.onlyTesting ?? args.only_testing;
-      let onlyTesting: string[] = [];
-      if (rawOnlyTesting !== undefined) {
-        const rejected = {
+      // Command assembly lives in a pure function so the exact argv can be tested
+      // directly; the side effects that prepare a run (project discovery, the target
+      // preflight, `simctl shutdown all`) stay in this method.
+      const invocation = buildXcodeInvocation({ args, config, cwd, action, target, scheme });
+      if ('error' in invocation) {
+        return {
           ok: false,
+          summary: invocation.error,
           command: 'xcodebuild',
           target,
           errorCount: 0,
           warningCount: 0,
           notes,
         };
-        if (!Array.isArray(rawOnlyTesting)) {
-          return {
-            ...rejected,
-            summary: '`onlyTesting` must be an array of test identifiers, e.g. ["LunisolarCalendarUITests"]',
-          };
-        }
-        const malformed = rawOnlyTesting.filter((entry) => !isNonEmptyString(entry)).length;
-        if (malformed > 0) {
-          return {
-            ...rejected,
-            summary:
-              `every \`onlyTesting\` entry must be a non-empty string; ` +
-              `${malformed} entr${malformed === 1 ? 'y is' : 'ies are'} not`,
-          };
-        }
-        onlyTesting = [...new Set(rawOnlyTesting.map((entry) => (entry as string).trim()))];
-        if (onlyTesting.length === 0) {
-          return {
-            ...rejected,
-            summary: '`onlyTesting` was empty; list at least one test identifier, or omit the argument',
-          };
-        }
       }
-
-      const argv: string[] = [config.xcodebuildPath, action, flag, target];
-      if (scheme !== undefined) argv.push('-scheme', scheme);
-      if (configuration !== undefined) argv.push('-configuration', configuration);
-
-      let destination = isNonEmptyString(args.destination) ? args.destination.trim() : undefined;
-      const needsDestination = action !== 'clean' && action !== 'build-for-testing';
-      if (destination === undefined && needsDestination) {
-        const simulator = isNonEmptyString(args.simulator) ? args.simulator.trim() : undefined;
-        const os = isNonEmptyString(args.os) ? args.os.trim() : undefined;
-        if (simulator !== undefined) {
-          destination =
-            os !== undefined
-              ? `platform=iOS Simulator,name=${simulator},OS=${os}`
-              : `platform=iOS Simulator,name=${simulator}`;
-        }
-      }
-      if (destination !== undefined) argv.push('-destination', destination);
-
-      // `xcodebuild` accepts both `-only-testing <id>` and `-only-testing:<id>`;
-      // the joined form is the one this repository's Tools/run_tests.sh uses.
-      for (const identifier of onlyTesting) argv.push(`-only-testing:${identifier}`);
-      if (onlyTesting.length > 0 && !TEST_ACTIONS.has(action)) {
-        notes.push(
-          `\`onlyTesting\` only constrains test actions; the \`${action}\` action ignores it`,
-        );
-      }
-      // DerivedData decides whether repeat builds are incremental. Precedence:
-      // the per-call argument, then the configured path, then the built-in
-      // default — and the result is applied unconditionally.
-      //
-      // Gating the default on the directory already existing (the earlier
-      // behaviour) made it unreachable: nothing else creates
-      // `<cwd>/.dsh/DerivedData`, so the default could never bootstrap itself and
-      // every build kept writing to the shared ~/Library DerivedData. The price of
-      // applying it is one full rebuild the first time a workspace switches
-      // location; `xcodebuild` creates the directory itself.
-      //
-      // The path is a single argv element: no shell parses this command, so
-      // quoting it (`-derivedDataPath "<path>"`) would literally embed quotes in
-      // the path and break the build.
-      const requestedDerivedData = isNonEmptyString(args.derived_data_path)
-        ? args.derived_data_path.trim()
-        : config.derivedDataPath;
-      const derivedDataIsExplicit =
-        isNonEmptyString(args.derived_data_path) || config.derivedDataPathConfigured;
-      const derivedDataPath =
-        requestedDerivedData.length === 0
-          ? undefined
-          : isAbsolute(requestedDerivedData)
-            ? requestedDerivedData
-            : join(cwd, requestedDerivedData);
-
-      const usedDerivedData = derivedDataPath;
-      if (usedDerivedData !== undefined) {
-        notes.push(
-          derivedDataIsExplicit
-            ? `using the configured DerivedData path: ${usedDerivedData}`
-            : `using the workspace DerivedData path (default) for incremental builds: ${usedDerivedData}`,
-        );
-        argv.push('-derivedDataPath', usedDerivedData);
-      }
-
-      if (Array.isArray(args.extra_args)) {
-        for (const entry of args.extra_args) {
-          if (isNonEmptyString(entry)) argv.push(entry);
-        }
-      }
+      notes.push(...invocation.notes);
+      const argv = invocation.argv;
+      const destination = invocation.destination;
+      const usedDerivedData = invocation.derivedDataPath;
 
       // This repository's UI channels are documented to flake unless every
       // simulator is shut down first: leftover simulator state produced random
@@ -1938,7 +1985,7 @@ export function apply(ctx: Ctx, rawConfig?: unknown): () => void {
             notes.push(`\`simctl shutdown all\` did not succeed: ${bounded(shutdown.output, 400).text}`);
           }
         } else {
-          const booted = await bootedSimulatorNames(ctx, config, cwd);
+          const booted = await bootedSimulatorNames(ctx, config, cwd, exec.signal);
           if (booted.length > 0) {
             notes.push(
               `${booted.length} simulator(s) are already booted (${booted.join(', ')}); this project's UI ` +
@@ -2114,7 +2161,7 @@ export function apply(ctx: Ctx, rawConfig?: unknown): () => void {
     async execute(args: Record<string, unknown>, exec: ToolExecContext): Promise<Record<string, unknown>> {
       const cwd = resolveCwd(config, args.cwd);
       const notes: string[] = [];
-      const discovered = await discoverProject(ctx, config, cwd);
+      const discovered = await discoverProject(ctx, config, cwd, exec.signal);
       const runtimes = await runCommand(ctx, config, {
         argv: [config.xcrunPath, 'simctl', 'list', 'runtimes', '-j'],
         cwd,
@@ -2491,7 +2538,7 @@ export function apply(ctx: Ctx, rawConfig?: unknown): () => void {
       }
 
       if (action === 'booted') {
-        const resolved = await resolveDevice(ctx, config, cwd, undefined);
+        const resolved = await resolveDevice(ctx, config, cwd, undefined, exec.signal);
         if (resolved.udid === undefined) {
           return { ok: false, action, summary: messageOr(resolved.note, 'no booted simulator'), notes };
         }
@@ -2514,7 +2561,7 @@ export function apply(ctx: Ctx, rawConfig?: unknown): () => void {
         };
       }
 
-      const resolved = await resolveDevice(ctx, config, cwd, args.device);
+      const resolved = await resolveDevice(ctx, config, cwd, args.device, exec.signal);
       if (resolved.udid === undefined) {
         return { ok: false, action, summary: messageOr(resolved.note, 'no matching simulator'), notes };
       }
@@ -2661,7 +2708,7 @@ export function apply(ctx: Ctx, rawConfig?: unknown): () => void {
         return { ok: false, summary: 'bundle_id is required to launch the app', appPath, notes };
       }
 
-      const resolved = await resolveDevice(ctx, config, cwd, args.device);
+      const resolved = await resolveDevice(ctx, config, cwd, args.device, exec.signal);
       if (resolved.udid === undefined) {
         return { ok: false, summary: messageOr(resolved.note, 'no matching simulator'), appPath, notes };
       }
@@ -2885,7 +2932,7 @@ export function apply(ctx: Ctx, rawConfig?: unknown): () => void {
       const cwd = resolveCwd(config, args.cwd);
       const notes: string[] = [];
 
-      const resolved = await resolveDevice(ctx, config, cwd, args.device);
+      const resolved = await resolveDevice(ctx, config, cwd, args.device, exec.signal);
       if (resolved.udid === undefined) {
         return {
           ok: false,
@@ -2992,7 +3039,7 @@ export function apply(ctx: Ctx, rawConfig?: unknown): () => void {
       const cwd = resolveCwd(config, args.cwd);
       const notes: string[] = [];
 
-      const resolved = await resolveDevice(ctx, config, cwd, args.device);
+      const resolved = await resolveDevice(ctx, config, cwd, args.device, exec.signal);
       if (resolved.udid === undefined) {
         return {
           ok: false,
@@ -3171,7 +3218,7 @@ export function apply(ctx: Ctx, rawConfig?: unknown): () => void {
         };
       }
 
-      const resolved = await resolveDevice(ctx, config, cwd, args.device);
+      const resolved = await resolveDevice(ctx, config, cwd, args.device, exec.signal);
       if (resolved.udid === undefined) {
         return {
           ok: false,
@@ -3338,7 +3385,7 @@ export function apply(ctx: Ctx, rawConfig?: unknown): () => void {
       const cwd = resolveCwd(config, args.cwd);
       const notes: string[] = [];
 
-      const resolved = await resolveDevice(ctx, config, cwd, args.device);
+      const resolved = await resolveDevice(ctx, config, cwd, args.device, exec.signal);
       if (resolved.udid === undefined) {
         return {
           ok: false,

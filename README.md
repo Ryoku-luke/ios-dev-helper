@@ -60,6 +60,17 @@ destination) become `<producer>: severity: message`.
   directory. With several schemes it picks the one named after the project or
   workspace (Xcode's own convention for the app target) and says so in the
   notes; pass `scheme` to build a different one.
+- An **explicit `target` is checked before anything is spawned**: a path that does
+  not exist fails immediately, naming the candidates that *are* in the directory,
+  instead of paying for a full `xcodebuild` start that reports a bare
+  "does not exist".
+- `configuration` is appended as `-configuration <value>` when supplied. When it is
+  omitted, xcodebuild uses the scheme's own build configuration rather than this
+  tool forcing one. (Until 2026-10-16 the value was accepted and then never used, so
+  `configuration: "Release"` silently built Debug.)
+- Failure causes that the raw output leaves unexplained are translated: a
+  write-permission signature (`Operation not permitted`, `… is not writable`)
+  becomes a summary clause and a note saying which paths and permissions to check.
 - `action`: `build` (default), `test`, `clean`, `build-for-testing`,
   `test-without-building`.
 - `onlyTesting` narrows a test action to specific identifiers, each appended as
@@ -151,6 +162,25 @@ as success rather than an error.
 
 Installs a built `.app` on a simulator and optionally launches it.
 `bundle_id` is required to launch and optional when only installing.
+
+- The install budget is `simctlTimeoutMs` (default 2 minutes), because a large
+  `.app` has to be copied into the device container. Both the install and the
+  launch report how long they took, so a slow bundle is visible rather than
+  guessed at.
+- **One retry on infrastructure flake only.** A failed install is retried once
+  (after a 1s pause) when its output matches `FLAKY_SIMCTL_PATTERN` — the same
+  signals this repository's `Tools/run_tests.sh:50` treats as retryable. A real
+  failure (a missing bundle, no space left) is never retried, mirroring the
+  project's rule that genuine failures are reported, not retried.
+- **Timeouts are named, not silently swallowed.** A budget-stopped install reads
+  `install timed out after N ms (…)`, a stopped launch reads
+  `launch timed out after N ms`, and each adds a note pointing at
+  `simctlTimeoutMs`. An operation that merely *crossed* the budget but finished on
+  its own is reported as success with a note, never as a timeout it did not have.
+- The tool's declared ceiling is `simctlTimeoutMs × 7 + 30s`: boot (1×) + install
+  with its retry (2×) + launch (4× when `--console-pty` streams until the app
+  exits). Declaring less would let the harness cancel a call that is still
+  legitimately working.
 
 ### `simulator_screenshot`
 
@@ -302,7 +332,7 @@ dependency). An unknown key is ignored; an absent key keeps its default.
 | `workspaceRoot` | `''` (use the Agent's cwd) | Pin builds to one checkout. |
 | `xcodebuildPath` | `xcodebuild` | Absolute path or PATH name. |
 | `xcrunPath` | `xcrun` | Absolute path or PATH name. |
-| `derivedDataPath` | `.dsh/DerivedData` | Where `xcodebuild` keeps intermediate products, so repeat builds stay incremental. A relative value resolves against the build's working directory. Applied once the directory exists, or unconditionally when set explicitly. The per-call `derived_data_path` argument wins over it. |
+| `derivedDataPath` | `.dsh/DerivedData` | Where `xcodebuild` keeps intermediate products, so repeat builds stay incremental. A relative value resolves against the build's working directory, and the result is **always** passed as `-derivedDataPath <path>`. Precedence: the per-call `derived_data_path` argument, then this config key, then the default. Applying it costs one full rebuild the first time a workspace switches location (`xcodebuild` creates the directory). |
 | `screenshotDir` | `.dsh/screenshots` | Where `simulator_screenshot` writes when no explicit `path` is given; relative to the build's working directory. |
 | `idbPath` | `idb` (PATH lookup) | The `idb` CLI used by `simulator_tap` and `simulator_elements`. A leading `~` expands to the home directory. Set it to `~/.dsh/tools/idb/bin/idb` for the layout above. |
 | `idbTimeoutMs` | `120000` | Budget for one `idb` call; the first one in a session also starts the companion daemon. |
@@ -312,7 +342,7 @@ dependency). An unknown key is ignored; an absent key keeps its default.
 | `buildTimeoutMs` | `900000` | Budget for one `xcodebuild`. |
 | `simctlTimeoutMs` | `120000` | Budget for one `simctl` call. |
 | `maxOutputBytes` | `8388608` | Per-stream collector budget. |
-| `maxDiagnostics` | `40` | Diagnostic bullets surfaced to the model. |
+| `maxDiagnostics` | `40` | Cap on the **error/warning** diagnostic bullets surfaced to the model; `note` lines are never surfaced. The cap limits bullets only — the summary counts every diagnostic, and an omission note reports how many were left out. |
 | `maxOutputChars` | `6000` | Raw output tail surfaced to the model. |
 | `graceMs` | `3000` | SIGTERM→SIGKILL grace. |
 | `injectSwiftUIGuidance` | `true` | Register the prompt section. |
@@ -343,5 +373,10 @@ dsh plugin --profile "$DSH_PROFILE" install /path/to/Tools/ios-dev-helper
   so a clean build does not look alarming. The raw log is bounded to the **last**
   `maxOutputChars` characters, because a build log puts its verdict at the end;
   raise that key when you need more of it.
+  - The SwiftPM/sandbox-cache whitelist from `Tools/run_tests.sh`
+    (`org.swift.swiftpm`, `not writable`, `readonly database`) filters **warnings
+    only**, matching how that script applies it. Until 2026-10-16 this plugin applied
+    it to every severity, which silently swallowed genuine `error:` lines — a
+    permission failure saying "… is not writable" among them.
 - `simulator_control` deliberately exposes no `spawn` action; arbitrary process
   execution stays with `bash`.

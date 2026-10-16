@@ -27,7 +27,7 @@
  * @module ios-dev-helper
  */
 
-import { existsSync, mkdirSync, readFileSync, statSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, readdirSync, readFileSync, statSync, writeFileSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { basename, dirname, isAbsolute, join } from 'node:path';
 
@@ -114,6 +114,26 @@ interface Diagnostic {
 }
 
 /** The normalized outcome of one managed child process. */
+/**
+ * The execution context DeepSeek Harness passes to every tool `execute` — the
+ * subset of its `ToolRunContext` this plugin consumes.
+ *
+ * Declared on all nine tools so the callback signature is uniform and reviewable;
+ * a tool that has no need of the signal names the parameter `_exec` to say the
+ * omission is deliberate rather than forgotten.
+ *
+ * `args` stays `Record<string, unknown>` on purpose. The harness forwards the
+ * model's JSON verbatim, so every field is validated at runtime
+ * (`isNonEmptyString`, `positiveNumber`, `Array.isArray`, …). Casting `args` to a
+ * per-tool interface would assert a shape nothing verified; the model-facing
+ * schema in each tool's `parameters` is the source of truth for what callers may
+ * send.
+ */
+interface ToolExecContext {
+  /** Aborted when the harness cancels or times out this call. */
+  signal?: AbortSignal;
+}
+
 interface CommandResult {
   /** Combined stdout/stderr, already bounded. */
   output: string;
@@ -123,8 +143,19 @@ interface CommandResult {
   signal: string | null;
   /** True when the collector dropped bytes because a stream overflowed. */
   lossy: boolean;
-  /** True when the harness killed the child for exceeding `timeoutMs`. */
+  /**
+   * True when the harness killed the child for exceeding `timeoutMs`.
+   *
+   * Note that this reports the *direct* process; see `quiescenceUnproven` for
+   * whether the rest of its managed range was confirmed gone as well.
+   */
   timedOut: boolean;
+  /**
+   * Set only after a timeout: true when the child's whole managed range could not
+   * be confirmed exited within a bounded wait (the direct process is gone, but
+   * grandchildren it spawned may still be running).
+   */
+  quiescenceUnproven?: boolean;
   /** True when no `subprocess` Service was available in this scope. */
   unavailable: boolean;
 }
@@ -284,12 +315,62 @@ function isNonEmptyString(value: unknown): value is string {
   return typeof value === 'string' && value.trim().length > 0;
 }
 
-/** Trim trailing whitespace and cap a string at `max` characters, keeping the head. */
+/**
+ * Pick a usable message, falling back when the candidate is missing *or blank*.
+ *
+ * `candidate ?? fallback` is not enough: a helper such as `bounded('')` yields an
+ * empty string, which `??` keeps, and the caller then reports a completely empty
+ * error — the worst possible outcome for a failure the model must act on.
+ * @param candidate Value to use when it is a non-empty string.
+ * @param fallback Message returned when `candidate` is missing or blank.
+ * @returns The chosen message, trimmed.
+ */
+function messageOr(candidate: string | undefined, fallback: string): string {
+  return isNonEmptyString(candidate) ? candidate.trim() : fallback;
+}
+
+/**
+ * Clamp a string to at most `max` UTF-16 code units without splitting a
+ * surrogate pair, keeping the head.
+ *
+ * `slice` counts code units, so an astral-plane character straddling the cut (an
+ * emoji, a rare CJK extension-B ideograph such as 𠀀) is left as a lone
+ * surrogate: it renders as U+FFFD and corrupts the text. Dropping the trailing
+ * high surrogate keeps the result valid. BMP text — ordinary Chinese included —
+ * is a single code unit per character and is unaffected either way.
+ * @param text Text to clamp.
+ * @param max Maximum number of UTF-16 code units to keep.
+ * @returns The head of `text`, never ending on a lone high surrogate.
+ */
+function clampHead(text: string, max: number): string {
+  if (text.length <= max) return text;
+  const cut = text.slice(0, max);
+  return /[\uD800-\uDBFF]$/.test(cut) ? cut.slice(0, -1) : cut;
+}
+
+/**
+ * Clamp a string to `max` code units, keeping the tail, without splitting a pair.
+ * @param text Text to clamp.
+ * @param max Maximum number of UTF-16 code units to keep.
+ * @returns The tail of `text`, never starting on a lone low surrogate.
+ */
+function clampTail(text: string, max: number): string {
+  if (text.length <= max) return text;
+  const cut = text.slice(text.length - max);
+  return /^[\uDC00-\uDFFF]/.test(cut) ? cut.slice(1) : cut;
+}
+
+/**
+ * Trim trailing whitespace and cap a string at `max` characters, keeping the head.
+ * @param text Text to clamp.
+ * @param max Character budget for the kept head.
+ * @returns The clamped head plus whether anything was dropped.
+ */
 function bounded(text: string, max: number): { text: string; truncated: boolean } {
   const trimmed = text.trim();
   return trimmed.length <= max
     ? { text: trimmed, truncated: false }
-    : { text: `${trimmed.slice(0, max)}\n… (${trimmed.length - max} more characters truncated)`, truncated: true };
+    : { text: `${clampHead(trimmed, max)}\n… (${trimmed.length - max} more characters truncated)`, truncated: true };
 }
 
 /**
@@ -297,17 +378,24 @@ function bounded(text: string, max: number): { text: string; truncated: boolean 
  *
  * Build logs put their verdict last (`** BUILD SUCCEEDED **`, the error count,
  * the failing target), so the tail is the useful half of a long log.
+ * @param text Text to clamp.
+ * @param max Character budget for the kept tail.
+ * @returns The clamped tail plus whether anything was dropped.
  */
 function boundedTail(text: string, max: number): { text: string; truncated: boolean } {
   const trimmed = text.trim();
   return trimmed.length <= max
     ? { text: trimmed, truncated: false }
-    : { text: `… (${trimmed.length - max} earlier characters truncated)\n${trimmed.slice(trimmed.length - max)}`, truncated: true };
+    : { text: `… (${trimmed.length - max} earlier characters truncated)\n${clampTail(trimmed, max)}`, truncated: true };
 }
 
 /**
  * Run one managed child process to completion and collect its bounded output.
  * A nonzero exit code is a normal result; only infrastructure failures throw.
+ * @param ctx Plugin context carrying the `subprocess` service.
+ * @param config Resolved plugin configuration (budgets and signal grace).
+ * @param options Command line, working directory, time budget, optional caller signal.
+ * @returns Exit facts plus the combined, bounded output; an infrastructure failure comes back as `unavailable` rather than throwing.
  */
 async function runCommand(
   ctx: Ctx,
@@ -338,6 +426,7 @@ async function runCommand(
   let timedOut = false;
   const collect = { maxBytes: config.maxOutputBytes };
   let clearTimer: (() => void) | undefined;
+  let clearQuiescenceTimer: (() => void) | undefined;
 
   try {
     // Spawn inside the guard: a provider may reject an executable synchronously
@@ -358,7 +447,39 @@ async function runCommand(
     clearTimer = () => clearTimeout(timer);
 
     const outcome = await handle.done;
-    if (timedOut && outcome.exitCode === null) handle.terminate();
+
+    // Aborting starts the provider's own teardown (`graceMs` is its SIGTERM ->
+    // SIGKILL grace), and `done` resolves on the *direct* process exit. A killed
+    // build can therefore still have its managed range alive — the compiler
+    // children `xcodebuild` spawned — so hold the tier on real quiescence before
+    // reporting. The wait is bounded so the tool can never hang on it, and a
+    // failure to prove quiescence is reported rather than swallowed.
+    let quiescenceUnproven: boolean | undefined;
+    if (timedOut) {
+      if (outcome.exitCode === null) handle.terminate();
+      if (typeof handle.waitForExit === 'function') {
+        let deadlineTimer: ReturnType<typeof setTimeout> | undefined;
+        const deadline = new Promise<boolean>((resolve) => {
+          // Armed here, not inside the cleanup, so the bound is real: without it a
+          // provider that never reports quiescence would hang the tool forever.
+          deadlineTimer = setTimeout(() => resolve(false), config.graceMs + 2000);
+        });
+        clearQuiescenceTimer = () => {
+          if (deadlineTimer !== undefined) clearTimeout(deadlineTimer);
+        };
+        const quiesced = await Promise.race([
+          handle.waitForExit().then(
+            () => true,
+            () => false,
+          ),
+          deadline,
+        ]);
+        quiescenceUnproven = !quiesced;
+      } else {
+        quiescenceUnproven = true;
+      }
+    }
+
     const stdout = handle.collected.stdout?.readFrom(0);
     const stderr = handle.collected.stderr?.readFrom(0);
     const pieces: string[] = [];
@@ -372,6 +493,7 @@ async function runCommand(
       signal: outcome.signal,
       lossy: stdout?.lossy === true || stderr?.lossy === true,
       timedOut,
+      ...(quiescenceUnproven !== undefined ? { quiescenceUnproven } : {}),
       unavailable: false,
     };
   } catch (error) {
@@ -386,8 +508,29 @@ async function runCommand(
     };
   } finally {
     clearTimer?.();
+    clearQuiescenceTimer?.();
     caller?.removeEventListener('abort', onCallerAbort);
   }
+}
+
+/**
+ * True when the budget's own signal is what ended the child.
+ *
+ * `timedOut` only records that the timer fired; saying "terminated" when the child
+ * actually ended by itself is a false statement that sends the caller chasing a
+ * timeout which killed nothing.
+ */
+function stoppedByBudget(result: CommandResult): boolean {
+  return result.timedOut && result.signal !== null;
+}
+
+/**
+ * True when the budget expired but the child had already finished on its own, so
+ * nothing was killed and `exitCode` is its real verdict (0 means the work
+ * succeeded and must not be reported as a failure).
+ */
+function outlivedBudget(result: CommandResult): boolean {
+  return result.timedOut && result.signal === null && result.exitCode !== null;
 }
 
 // Xcode diagnostics look like:
@@ -410,9 +553,21 @@ const TARGET_HEADER_PATTERN = /^===\s*(.+?)\s*===$/;
  * Only `error` and `warning` become bullets: `note` lines are informational
  * (input encodings, dependency-order chatter) and on a clean build they used to
  * bury the verdict under a dozen irrelevant lines.
+ *
+ * `limit` caps the *bullets*, not the counting: the scan always walks the whole
+ * output, so `omitted` reports how many further error/warning lines were left out
+ * instead of silently breaking. Stopping at the cap used to also undercount the
+ * summary — a build with 100 errors was reported as "40 error(s)".
+ * @param output Combined stdout/stderr of one `xcodebuild` run.
+ * @param limit Maximum number of bullets to keep; the scan and counting are unaffected.
+ * @returns The kept `items` plus per-severity `omitted` counts.
  */
-function parseDiagnostics(output: string, limit: number): Diagnostic[] {
+function parseDiagnostics(
+  output: string,
+  limit: number,
+): { items: Diagnostic[]; omitted: { error: number; warning: number } } {
   const found: Diagnostic[] = [];
+  const omitted = { error: 0, warning: 0 };
   for (const line of output.split(/\r?\n/)) {
     if (TARGET_HEADER_PATTERN.test(line)) continue;
     let file = '';
@@ -441,8 +596,19 @@ function parseDiagnostics(output: string, limit: number): Diagnostic[] {
     }
 
     if (severity === 'note') continue;
-    // Skip the SwiftPM/sandbox cache noise this project deliberately whitelists.
-    if (/swiftpm|not writable|readonly database/i.test(message)) continue;
+    // This project whitelists SwiftPM/sandbox cache noise in
+    // `Tools/run_tests.sh` (`CHANNEL_FORBID_ALLOW`), where it is applied to
+    // *warning* lines only. Applying it to every severity here silently swallowed
+    // genuine errors: "… is not writable" is precisely how a permission failure
+    // reads, and dropping it left the caller with "0 error(s)".
+    if (severity === 'warning' && /swiftpm|not writable|readonly database/i.test(message)) continue;
+    if (found.length >= limit) {
+      // Past the bullet budget: keep counting so the summary stays truthful and
+      // the caller learns the list was cut.
+      if (severity === 'error') omitted.error += 1;
+      else omitted.warning += 1;
+      continue;
+    }
     found.push({
       file: file.length === 0 ? 'xcodebuild' : file,
       ...(lineNumber !== undefined ? { line: lineNumber } : {}),
@@ -450,12 +616,43 @@ function parseDiagnostics(output: string, limit: number): Diagnostic[] {
       severity,
       message: message.trim(),
     });
-    if (found.length >= limit) break;
   }
-  return found;
+  return { items: found, omitted };
 }
 
-/** Render diagnostics as compact single lines, deduplicated in order. */
+/**
+ * Failure signatures `xcodebuild` emits when it cannot write where it needs to.
+ *
+ * These arrive as opaque `NSPOSIXErrorDomain … Operation not permitted` or
+ * `… is not writable` lines that name no cause, so they are worth translating into
+ * something the caller can act on.
+ */
+const WRITE_BLOCKED_PATTERN =
+  /Operation not permitted|Permission denied|Read-only file system|not writable|readonly database/i;
+
+/**
+ * Describe a write-permission failure found in build output, or `undefined` when
+ * the output shows none.
+ *
+ * @param output Combined stdout/stderr of one `xcodebuild` run.
+ * @returns A one-clause cause naming what to check, or `undefined`.
+ */
+function describeWriteBlockedCause(output: string): string | undefined {
+  const match = WRITE_BLOCKED_PATTERN.exec(output);
+  if (match === null) return undefined;
+  return (
+    `a write-permission failure (matched "${match[0]}"): check that the project directory and the ` +
+    'DerivedData path are writable, and that this process is allowed to write there — a confined ' +
+    'shell cannot write under ~/Library/Developer'
+  );
+}
+
+/**
+ * Render diagnostics as compact single lines, deduplicated in order.
+ *
+ * @param diagnostics Parsed diagnostics, already capped by `maxDiagnostics`.
+ * @returns Newline-joined `- <where>: <severity>: <message>` bullets.
+ */
 function formatDiagnostics(diagnostics: Diagnostic[]): string {
   const seen = new Set<string>();
   const lines: string[] = [];
@@ -474,7 +671,13 @@ function formatDiagnostics(diagnostics: Diagnostic[]): string {
   return lines.join('\n');
 }
 
-/** Discover the workspace/project, schemes, and default scheme in one directory. */
+/**
+ * Discover the workspace/project, schemes, and default scheme in one directory.
+ * @param ctx Plugin context carrying the `subprocess` service.
+ * @param config Resolved plugin configuration.
+ * @param cwd Directory to look for an `.xcworkspace`/`.xcodeproj` in.
+ * @returns The chosen target, its schemes, any tool-level diagnostic, and a log line when nothing was found.
+ */
 async function discoverProject(
   ctx: Ctx,
   config: HelperConfig,
@@ -485,13 +688,11 @@ async function discoverProject(
   diagnostics: string;
   detectionLog: string;
 }> {
-  const ls = await runCommand(ctx, config, {
-    argv: [config.xcrunPath, 'simctl', 'list', 'devices', 'available'],
-    cwd,
-    timeoutMs: config.simctlTimeoutMs,
-  });
-  if (ls.unavailable) return { schemes: [], diagnostics: '', detectionLog: ls.output };
-
+  // Discovery is about files in `cwd`. It used to begin with a
+  // `xcrun simctl list devices available` call whose result was never read except
+  // for an `unavailable` guard — a wasted spawn on every build, and a misleading
+  // early exit: with `xcrun` unusable (Xcode not selected) discovery reported
+  // "no project found" for a project sitting right there.
   const probe = await runCommand(ctx, config, {
     argv: ['/bin/sh', '-c', 'ls -1d *.xcworkspace *.xcodeproj 2>/dev/null'],
     cwd,
@@ -546,6 +747,8 @@ async function discoverProject(
  * that brace instead of the document. A real JSON object opens with `"` (a
  * quoted key) or `}` (empty), so each `{` is checked against that before
  * scanning its balanced extent.
+ * @param output Text that may contain a JSON object.
+ * @returns The first balanced `{…}` slice, or undefined when there is none.
  */
 function extractJsonObject(output: string): string | undefined {
   for (let start = output.indexOf('{'); start >= 0; start = output.indexOf('{', start + 1)) {
@@ -559,7 +762,12 @@ function extractJsonObject(output: string): string | undefined {
   return undefined;
 }
 
-/** Scan a balanced brace region starting at `start`, honouring string literals. */
+/**
+ * Scan a balanced brace region starting at `start`, honouring string literals.
+ * @param output Text to scan.
+ * @param start Index of the opening `{`.
+ * @returns The balanced object slice, or undefined when it never closes.
+ */
 function scanBalancedObject(output: string, start: number): string | undefined {
   let depth = 0;
   let inString = false;
@@ -586,6 +794,8 @@ function scanBalancedObject(output: string, start: number): string | undefined {
  * Parse a JSON document out of tool output, tolerating extractor or toolchain
  * surprises. A malformed document yields `undefined` so the caller can fall
  * back to a text form instead of failing the whole tool call.
+ * @param output Text that may contain a JSON object.
+ * @returns The parsed object, or undefined when it is absent or malformed.
  */
 function parseJsonObject(output: string): Record<string, any> | undefined {
   const candidate = extractJsonObject(output);
@@ -598,7 +808,11 @@ function parseJsonObject(output: string): Record<string, any> | undefined {
   }
 }
 
-/** Extract the scheme list from the human-readable `xcodebuild -list` output. */
+/**
+ * Extract the scheme list from the human-readable `xcodebuild -list` output.
+ * @param output Human-readable `xcodebuild -list` text.
+ * @returns Scheme names in the order they were encountered.
+ */
 function schemesFromText(output: string): string[] {
   const match = /Schemes:\s*\n([\s\S]*?)(?:\n\s*\n|$)/.exec(output);
   if (match === null) return [];
@@ -615,6 +829,9 @@ function schemesFromText(output: string): string[] {
  * project (or workspace), so an exact name match is the safest automatic choice.
  * A scheme merely *starting* with that name (e.g. `App` vs `AppWidgets`) is the
  * next-best guess; anything else is ambiguous and left to the caller.
+ * @param schemes Scheme names reported by `xcodebuild -list`.
+ * @param target Project or workspace file name.
+ * @returns The scheme whose name matches the target stem, or undefined when none does.
  */
 function preferredScheme(schemes: readonly string[], target: string): string | undefined {
   const base = target.replace(/\.(xcodeproj|xcworkspace)$/i, '');
@@ -627,20 +844,34 @@ function preferredScheme(schemes: readonly string[], target: string): string | u
   );
 }
 
-/** Resolve the working directory for a tool call. */
+/**
+ * Resolve the working directory for a tool call.
+ * @param config Resolved plugin configuration (supplies `workspaceRoot`).
+ * @param requested Per-call `cwd` override, when present.
+ * @returns The absolute working directory to run a command in.
+ */
 function resolveCwd(config: HelperConfig, requested: unknown): string {
   if (isNonEmptyString(requested)) return requested;
   if (config.workspaceRoot.length > 0) return config.workspaceRoot;
   return process.cwd();
 }
 
-/** Read the runtime-grouped device map from a `simctl ... -j` document. */
+/**
+ * Read the runtime-grouped device map from a `simctl ... -j` document.
+ * @param document Parsed `simctl list … -j` document.
+ * @returns The `devices` map, or an empty object when it is absent.
+ */
 function deviceGroups(document: Record<string, any>): Record<string, Array<Record<string, unknown>>> {
   const devices = document.devices;
   return devices !== null && typeof devices === 'object' ? (devices as Record<string, Array<Record<string, unknown>>>) : {};
 }
 
-/** Render a `simctl list devices -j` document into compact text. */
+/**
+ * Render a `simctl list devices -j` document into compact text.
+ * @param document Parsed `simctl list devices -j` document.
+ * @param runtimeFilter Optional case-insensitive runtime substring to keep.
+ * @returns A compact multi-line listing, or `no matching simulators`.
+ */
 function formatDevices(document: Record<string, any>, runtimeFilter?: string): string {
   const lines: string[] = [];
   for (const [runtime, devices] of Object.entries(deviceGroups(document))) {
@@ -662,6 +893,10 @@ function formatDevices(document: Record<string, any>, runtimeFilter?: string): s
  *
  * `simctl list devices booted -j` only ever reports booted devices, so any entry
  * here is state a test run has to contend with.
+ * @param ctx Plugin context carrying the `subprocess` service.
+ * @param config Resolved plugin configuration.
+ * @param cwd Directory to run the query in.
+ * @returns Names of currently booted simulators (empty when none, or when the list is unreadable).
  */
 async function bootedSimulatorNames(ctx: Ctx, config: HelperConfig, cwd: string): Promise<string[]> {
   const listed = await runCommand(ctx, config, {
@@ -677,7 +912,14 @@ async function bootedSimulatorNames(ctx: Ctx, config: HelperConfig, cwd: string)
     .filter(isNonEmptyString);
 }
 
-/** Resolve a simulator selector (UDID, `booted`, or a device name) to a UDID. */
+/**
+ * Resolve a simulator selector (UDID, `booted`, or a device name) to a UDID.
+ * @param ctx Plugin context carrying the `subprocess` service.
+ * @param config Resolved plugin configuration.
+ * @param cwd Directory to run the lookup in.
+ * @param requested UDID, device name, `booted`, or undefined to mean the booted device.
+ * @returns The resolved UDID, or a `note` saying why none could be resolved.
+ */
 async function resolveDevice(
   ctx: Ctx,
   config: HelperConfig,
@@ -691,7 +933,9 @@ async function resolveDevice(
       timeoutMs: config.simctlTimeoutMs,
     });
     const document = parseJsonObject(booted.output);
-    if (document === undefined) return { note: bounded(booted.output, 2000).text };
+    if (document === undefined) {
+      return { note: messageOr(bounded(booted.output, 2000).text, 'could not read the booted-device list from `xcrun simctl`') };
+    }
     const devices = Object.values(deviceGroups(document)).flat();
     const first = devices[0];
     if (first === undefined) return { note: 'no booted simulator; boot one with simulator_control first' };
@@ -699,7 +943,30 @@ async function resolveDevice(
   }
 
   const selector = requested.trim();
-  if (/^[0-9A-Fa-f-]{36}$/.test(selector)) return { udid: selector };
+  if (UDID_PATTERN.test(selector)) {
+    // A well-formed UDID is not proof that the device exists: a typo would sail
+    // through to simctl and come back as a bare "Invalid device or device pair",
+    // naming no alternative. Verify against the *full* device list (unavailable
+    // devices included, because `erase`/`delete` may legitimately target one), and
+    // pass the selector through only when that list cannot be read at all.
+    const known = await runCommand(ctx, config, {
+      argv: [config.xcrunPath, 'simctl', 'list', 'devices', '-j'],
+      cwd,
+      timeoutMs: config.simctlTimeoutMs,
+    });
+    const document = parseJsonObject(known.output);
+    if (document === undefined) return { udid: selector };
+    const exists = Object.values(deviceGroups(document))
+      .flat()
+      .some((device) => String(device.udid ?? '').toLowerCase() === selector.toLowerCase());
+    return exists
+      ? { udid: selector }
+      : {
+          note:
+            `no simulator has the UDID \`${selector}\`; call action "list" to see the available ` +
+            'devices, or pass a device name instead',
+        };
+  }
   if (selector === 'booted') return resolveDevice(ctx, config, cwd, undefined);
 
   const listed = await runCommand(ctx, config, {
@@ -708,7 +975,9 @@ async function resolveDevice(
     timeoutMs: config.simctlTimeoutMs,
   });
   const document = parseJsonObject(listed.output);
-  if (document === undefined) return { note: bounded(listed.output, 2000).text };
+  if (document === undefined) {
+    return { note: messageOr(bounded(listed.output, 2000).text, 'could not read the device list from `xcrun simctl`') };
+  }
   const matches: Array<Record<string, unknown>> = [];
   for (const devices of Object.values(deviceGroups(document))) {
     for (const device of devices) {
@@ -739,7 +1008,11 @@ interface AttachmentsLike {
   }): Promise<Record<string, unknown>>;
 }
 
-/** Resolve the optional `attachments` Service, or undefined when unavailable. */
+/**
+ * Resolve the optional `attachments` Service, or undefined when unavailable.
+ * @param ctx Plugin context.
+ * @returns The optional `attachments` service, or undefined when it is not mounted.
+ */
 function attachmentsOf(ctx: Ctx): AttachmentsLike | undefined {
   const service = ctx.get('attachments');
   if (service === null || typeof service !== 'object') return undefined;
@@ -748,7 +1021,11 @@ function attachmentsOf(ctx: Ctx): AttachmentsLike | undefined {
     : undefined;
 }
 
-/** Describe a caught value, keeping any stable service error code. */
+/**
+ * Describe a caught value, keeping any stable service error code.
+ * @param error Any thrown value.
+ * @returns Its message, or a stringified form when it is not an `Error`.
+ */
 function describeError(error: unknown): string {
   if (error instanceof Error) {
     const code = (error as { code?: unknown }).code;
@@ -780,6 +1057,42 @@ const MAX_LOG_MESSAGE_CHARS = 400;
 const TEST_ACTIONS: ReadonlySet<string> = new Set(['test', 'test-without-building', 'build-for-testing']);
 
 /**
+ * CoreSimulator UDIDs are UUIDs in the canonical 8-4-4-4-12 form.
+ *
+ * The previous shape check (`^[0-9A-Fa-f-]{36}$`) also accepted things that are
+ * plainly not UDIDs — 36 hyphens, for instance — and then handed them to simctl.
+ */
+const UDID_PATTERN = /^[0-9A-Fa-f]{8}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{12}$/;
+
+/**
+ * CoreSimulator infrastructure flake, as this repository itself defines it.
+ *
+ * Mirrors `FLAKY_INFRA_PATTERN` in `Tools/run_tests.sh:50` — the project's own line
+ * between "the simulator infrastructure hiccuped, retry once" and "a real failure,
+ * never retry". Reusing the same signals keeps the two definitions from drifting.
+ */
+const FLAKY_SIMCTL_PATTERN =
+  /Failed to install or launch the test runner|failed preflight checks|SBMainWorkspace.*Busy|Unable to boot device|Timed out while loading|database is locked|device is busy/i;
+
+/**
+ * `simctl` verbs `simulator_control` exposes.
+ *
+ * A typo must be rejected *before* spawning anything: `xcrun simctl shutown <udid>`
+ * otherwise answers with its entire usage text, which tells the caller nothing
+ * about which argument was actually wrong.
+ */
+const SIMULATOR_ACTIONS: ReadonlySet<string> = new Set([
+  'list',
+  'boot',
+  'shutdown',
+  'booted',
+  'open',
+  'erase',
+  'delete',
+  'runtime_list',
+]);
+
+/**
  * `xcodebuild` actions that actually *run* tests rather than only preparing them.
  * These are the actions a booted simulator can interfere with, and the only ones
  * where "zero tests executed" is a meaningful signal.
@@ -800,6 +1113,9 @@ interface LogEntry {
  *
  * Non-JSON lines are skipped on purpose: `log` prints a banner naming the
  * resolved predicate, and the merged stderr contributes lines too.
+ * @param output Newline-delimited `log stream --style=ndjson` output.
+ * @param limit Maximum number of entries to return (the newest are kept).
+ * @returns The newest `entries` and how many matching records were seen.
  */
 function parseLogEntries(output: string, limit: number): { entries: LogEntry[]; matched: number } {
   const matched: LogEntry[] = [];
@@ -829,14 +1145,18 @@ function parseLogEntries(output: string, limit: number): { entries: LogEntry[]; 
       message:
         message.length <= MAX_LOG_MESSAGE_CHARS
           ? message
-          : `${message.slice(0, MAX_LOG_MESSAGE_CHARS)}… (${message.length - MAX_LOG_MESSAGE_CHARS} more chars)`,
+          : `${clampHead(message, MAX_LOG_MESSAGE_CHARS)}… (${message.length - MAX_LOG_MESSAGE_CHARS} more chars)`,
     });
   }
   // The newest entries are the interesting ones, so keep the tail.
   return { entries: matched.slice(-limit), matched: matched.length };
 }
 
-/** Render one log entry as a single compact line. */
+/**
+ * Render one log entry as a single compact line.
+ * @param entry One parsed log record.
+ * @returns A single compact line.
+ */
 function formatLogEntry(entry: LogEntry): string {
   const scope = entry.scope.length > 0 ? ` [${entry.scope}]` : '';
   return `${entry.time} ${entry.level.toUpperCase()} ${entry.process}${scope}: ${entry.message}`;
@@ -847,6 +1167,8 @@ function formatLogEntry(entry: LogEntry): string {
  *
  * `spawn` performs no shell expansion, so a configured `~/...` path would be
  * passed literally and fail to resolve.
+ * @param value A path that may start with `~` or `~/`.
+ * @returns The expanded path, unchanged when it has no leading `~`.
  */
 function expandHome(value: string): string {
   if (value === '~') return homedir();
@@ -864,7 +1186,11 @@ interface AccessibilityElement {
   height: number;
 }
 
-/** Centre of an element, the point a tap should hit. */
+/**
+ * Centre of an element, the point a tap should hit.
+ * @param element Accessibility element carrying a frame.
+ * @returns The rounded centre point a tap should target.
+ */
 function elementCentre(element: AccessibilityElement): { x: number; y: number } {
   return {
     x: Math.round(element.x + element.width / 2),
@@ -872,7 +1198,11 @@ function elementCentre(element: AccessibilityElement): { x: number; y: number } 
   };
 }
 
-/** Read a finite number from an unknown JSON field. */
+/**
+ * Read a finite number from an unknown JSON field.
+ * @param value Candidate JSON value.
+ * @returns The value when it is a finite number, otherwise undefined.
+ */
 function numberOf(value: unknown): number | undefined {
   return typeof value === 'number' && Number.isFinite(value) ? value : undefined;
 }
@@ -883,6 +1213,8 @@ function numberOf(value: unknown): number | undefined {
  * The payload is a flat array of accessibility nodes; `frame` is normally
  * present, but `AXFrame` (`"{{x, y}, {w, h}}"`) is kept as a fallback so a
  * format change degrades to missing elements rather than a thrown parse error.
+ * @param output Raw `idb ui describe-all` output (any text containing the JSON array).
+ * @returns Tappable elements with a positive frame; unparsable input yields an empty array.
  */
 function parseAccessibilityElements(output: string): AccessibilityElement[] {
   const start = output.indexOf('[');
@@ -934,7 +1266,11 @@ function parseAccessibilityElements(output: string): AccessibilityElement[] {
   return elements;
 }
 
-/** Render one element as a compact, tappable line. */
+/**
+ * Render one element as a compact, tappable line.
+ * @param element Element with a frame.
+ * @returns A compact `Type "label" id="…" @ (x, y)` line.
+ */
 function formatAccessibilityElement(element: AccessibilityElement): string {
   const centre = elementCentre(element);
   const id = element.uniqueId.length > 0 ? ` id=${JSON.stringify(element.uniqueId)}` : '';
@@ -954,6 +1290,9 @@ function formatAccessibilityElement(element: AccessibilityElement): string {
  * foreground app as a full-screen element labelled with its name, so matching it
  * would tap the middle of the screen — never what a caller asking for "Watch"
  * means. Those nodes still appear in `simulator_elements` output for context.
+ * @param elements Elements to search, as returned by `parseAccessibilityElements`.
+ * @param wanted Accessibility identifier or label supplied by the caller.
+ * @returns The best match (smallest frame among otherwise equal candidates), or undefined.
  */
 function findAccessibilityElement(
   elements: readonly AccessibilityElement[],
@@ -989,6 +1328,8 @@ function findAccessibilityElement(
  * This matters because a test action that matches nothing still exits 0 and
  * prints `** TEST SUCCEEDED **` with `Executed 0 tests`: without this count, a
  * typo in `onlyTesting` would read as a pass for tests that never ran.
+ * @param output Combined `xcodebuild test` output.
+ * @returns The largest `Executed N test(s)` count seen, or undefined when the line never appeared.
  */
 function countExecutedTests(output: string): number | undefined {
   let max: number | undefined;
@@ -999,7 +1340,11 @@ function countExecutedTests(output: string): number | undefined {
   return max;
 }
 
-/** A `ContentBlock`-shaped text block. */
+/**
+ * A `ContentBlock`-shaped text block.
+ * @param text Text to wrap.
+ * @returns A `text` content block.
+ */
 function textBlock(text: string): { type: 'text'; text: string } {
   return { type: 'text', text };
 }
@@ -1050,6 +1395,7 @@ const IDB_STATE_FILE_PATH = '/tmp/idb/state';
  * `Failed to connect to companion ... No such file or directory` instead of
  * spawning a fresh one. Only records whose socket file is provably gone are
  * removed, so a live companion is never touched.
+ * @returns How many stale records were removed (0 when the registry is absent or unreadable).
  */
 function pruneUnreachableIdbCompanions(): number {
   try {
@@ -1075,6 +1421,7 @@ function pruneUnreachableIdbCompanions(): number {
  * A filesystem-safe, sortable timestamp for generated filenames, e.g.
  * `2026-10-03T21-35-04-123Z`. Millisecond precision keeps two captures in the
  * same second from overwriting each other.
+ * @returns A filesystem-safe UTC timestamp for the current time.
  */
 function fileTimestamp(): string {
   return new Date().toISOString().replace(/[:.]/g, '-');
@@ -1263,7 +1610,10 @@ export function apply(ctx: Ctx, rawConfig?: unknown): () => void {
         },
         configuration: {
           type: 'string',
-          description: 'Build configuration, e.g. Debug or Release. Defaults to Debug.',
+          description:
+            'Build configuration, e.g. `Debug` or `Release`, appended as `-configuration <value>`. When ' +
+            "omitted, xcodebuild uses the scheme's own build configuration (usually Debug) rather than " +
+            'this tool forcing one.',
         },
         destination: {
           type: 'string',
@@ -1362,13 +1712,45 @@ export function apply(ctx: Ctx, rawConfig?: unknown): () => void {
         return [textBlock(text.length > 0 ? text : 'xcodebuild finished with no output')];
       },
     },
-    async execute(args: Record<string, unknown>, exec: { signal?: AbortSignal }): Promise<Record<string, unknown>> {
+    async execute(args: Record<string, unknown>, exec: ToolExecContext): Promise<Record<string, unknown>> {
       const cwd = resolveCwd(config, args.cwd);
       const notes: string[] = [];
       const started = Date.now();
 
       let target = isNonEmptyString(args.target) ? args.target.trim() : undefined;
       let scheme = isNonEmptyString(args.scheme) ? args.scheme.trim() : undefined;
+
+      // An explicit `target` that does not exist is the most common path mistake.
+      // xcodebuild would report it too, but only after a full process start, and
+      // its message does not say what is actually there. Fail fast instead, and
+      // name the candidates sitting in the directory.
+      if (target !== undefined) {
+        const targetPath = isAbsolute(target) ? target : join(cwd, target);
+        if (!existsSync(targetPath)) {
+          let candidates: string[] = [];
+          try {
+            candidates = readdirSync(cwd).filter(
+              (entry) => entry.endsWith('.xcodeproj') || entry.endsWith('.xcworkspace'),
+            );
+          } catch {
+            candidates = [];
+          }
+          return {
+            ok: false,
+            summary:
+              `no \`${target}\` at ${targetPath}. ` +
+              (candidates.length > 0
+                ? `Found instead: ${candidates.join(', ')}. `
+                : `No .xcodeproj/.xcworkspace in ${cwd} either. `) +
+              'Pass an existing path, or omit `target` to let it auto-discover the project.',
+            command: 'xcodebuild',
+            target,
+            errorCount: 0,
+            warningCount: 0,
+            notes,
+          };
+        }
+      }
 
       if (target === undefined || scheme === undefined) {
         const discovered = await discoverProject(ctx, config, cwd);
@@ -1423,7 +1805,11 @@ export function apply(ctx: Ctx, rawConfig?: unknown): () => void {
       }
 
       const action = isNonEmptyString(args.action) ? args.action.trim() : 'build';
-      const configuration = isNonEmptyString(args.configuration) ? args.configuration.trim() : 'Debug';
+      // `configuration` used to be computed and then never used: the parameter was
+      // documented and silently ignored, so `configuration: 'Release'` built Debug.
+      // Only an explicit request is forwarded — passing a default would override a
+      // scheme's own build configuration, which is not this tool's decision.
+      const configuration = isNonEmptyString(args.configuration) ? args.configuration.trim() : undefined;
       const flag = target.endsWith('.xcworkspace') ? '-workspace' : '-project';
 
       // `onlyTesting` constrains a test action to specific identifiers. The
@@ -1466,6 +1852,7 @@ export function apply(ctx: Ctx, rawConfig?: unknown): () => void {
 
       const argv: string[] = [config.xcodebuildPath, action, flag, target];
       if (scheme !== undefined) argv.push('-scheme', scheme);
+      if (configuration !== undefined) argv.push('-configuration', configuration);
 
       let destination = isNonEmptyString(args.destination) ? args.destination.trim() : undefined;
       const needsDestination = action !== 'clean' && action !== 'build-for-testing';
@@ -1491,10 +1878,14 @@ export function apply(ctx: Ctx, rawConfig?: unknown): () => void {
       }
       // DerivedData decides whether repeat builds are incremental. Precedence:
       // the per-call argument, then the configured path, then the built-in
-      // default. An explicit choice (argument or config) is always honoured, even
-      // before the directory exists — `xcodebuild` creates it. The default is
-      // only applied once `<cwd>/.dsh/DerivedData` actually exists, so a build
-      // never silently starts writing products somewhere new.
+      // default — and the result is applied unconditionally.
+      //
+      // Gating the default on the directory already existing (the earlier
+      // behaviour) made it unreachable: nothing else creates
+      // `<cwd>/.dsh/DerivedData`, so the default could never bootstrap itself and
+      // every build kept writing to the shared ~/Library DerivedData. The price of
+      // applying it is one full rebuild the first time a workspace switches
+      // location; `xcodebuild` creates the directory itself.
       //
       // The path is a single argv element: no shell parses this command, so
       // quoting it (`-derivedDataPath "<path>"`) would literally embed quotes in
@@ -1511,17 +1902,15 @@ export function apply(ctx: Ctx, rawConfig?: unknown): () => void {
             ? requestedDerivedData
             : join(cwd, requestedDerivedData);
 
-      let usedDerivedData: string | undefined;
-      if (derivedDataPath !== undefined) {
-        if (derivedDataIsExplicit) {
-          usedDerivedData = derivedDataPath;
-          notes.push(`using the configured DerivedData path: ${derivedDataPath}`);
-        } else if (existsSync(derivedDataPath)) {
-          usedDerivedData = derivedDataPath;
-          notes.push(`using the existing DerivedData path for incremental builds: ${derivedDataPath}`);
-        }
+      const usedDerivedData = derivedDataPath;
+      if (usedDerivedData !== undefined) {
+        notes.push(
+          derivedDataIsExplicit
+            ? `using the configured DerivedData path: ${usedDerivedData}`
+            : `using the workspace DerivedData path (default) for incremental builds: ${usedDerivedData}`,
+        );
+        argv.push('-derivedDataPath', usedDerivedData);
       }
-      if (usedDerivedData !== undefined) argv.push('-derivedDataPath', usedDerivedData);
 
       if (Array.isArray(args.extra_args)) {
         for (const entry of args.extra_args) {
@@ -1567,9 +1956,11 @@ export function apply(ctx: Ctx, rawConfig?: unknown): () => void {
         ...(exec.signal !== undefined ? { signal: exec.signal } : {}),
       });
       const command = argv.join(' ');
-      const diagnostics = parseDiagnostics(result.output, config.maxDiagnostics);
-      const errorCount = diagnostics.filter((item) => item.severity === 'error').length;
-      const warningCount = diagnostics.filter((item) => item.severity === 'warning').length;
+      const { items: diagnostics, omitted } = parseDiagnostics(result.output, config.maxDiagnostics);
+      const errorCount =
+        diagnostics.filter((item) => item.severity === 'error').length + omitted.error;
+      const warningCount =
+        diagnostics.filter((item) => item.severity === 'warning').length + omitted.warning;
       const tail = boundedTail(result.output, config.maxOutputChars);
 
       if (result.unavailable) {
@@ -1585,7 +1976,27 @@ export function apply(ctx: Ctx, rawConfig?: unknown): () => void {
         };
       }
 
-      if (result.timedOut) notes.push(`xcodebuild exceeded ${config.buildTimeoutMs} ms and was terminated`);
+      const killedByBudget = stoppedByBudget(result);
+      if (killedByBudget) {
+        notes.push(`xcodebuild exceeded ${config.buildTimeoutMs} ms and was terminated`);
+      } else if (outlivedBudget(result)) {
+        // The timer fired, but the build had already finished by itself; calling
+        // that a termination would be false, and an exit 0 here is a success.
+        notes.push(
+          `xcodebuild exceeded ${config.buildTimeoutMs} ms but had already finished on its own ` +
+            `(exit ${String(result.exitCode)})`,
+        );
+      } else if (result.timedOut) {
+        notes.push(
+          `xcodebuild exceeded ${config.buildTimeoutMs} ms and ended without reporting an exit status`,
+        );
+      }
+      if (result.quiescenceUnproven === true) {
+        notes.push(
+          'the xcodebuild process exited but its child processes were not confirmed gone within the ' +
+            'grace window; compiling children (swiftc/clang) may still be finishing in the background',
+        );
+      }
       if (result.lossy) notes.push('build output overflowed the in-memory budget and some output was dropped');
       if (result.exitCode !== 0 && diagnostics.length === 0) {
         notes.push(
@@ -1597,6 +2008,15 @@ export function apply(ctx: Ctx, rawConfig?: unknown): () => void {
         notes.push(
           'this project treats compiler warnings as failures (treatWarningsAsErrors); ' +
             'set treatWarningsAsErrors: false in the plugin config to relax it',
+        );
+      }
+      // The bullets are capped to protect the context; say so rather than letting
+      // the caller read a partial list as the whole story.
+      if (omitted.error + omitted.warning > 0) {
+        notes.push(
+          `only the first ${config.maxDiagnostics} error/warning bullets are listed; ` +
+            `${omitted.error} more error(s) and ${omitted.warning} more warning(s) were omitted — ` +
+            'raise maxDiagnostics in the plugin config to see them',
         );
       }
 
@@ -1616,20 +2036,25 @@ export function apply(ctx: Ctx, rawConfig?: unknown): () => void {
         notes.push(`xcodebuild executed ${executedTests} test(s)`);
       }
 
-      const ok = result.exitCode === 0 && errorCount === 0 && !warningsAreFatal && !result.timedOut && !noTestsRan;
+      const ok =
+        result.exitCode === 0 && errorCount === 0 && !warningsAreFatal && !killedByBudget && !noTestsRan;
       const elapsed = Math.round((Date.now() - started) / 1000);
       const verdict = noTestsRan
         ? `xcodebuild ${action} ran no tests in ${elapsed}s`
         : ok
           ? `xcodebuild ${action} succeeded in ${elapsed}s`
-          : result.timedOut
+          : killedByBudget
             ? `xcodebuild ${action} was terminated after ${config.buildTimeoutMs} ms`
           : `xcodebuild ${action} failed (exit ${result.exitCode ?? result.signal ?? 'unknown'}) after ${elapsed}s`;
       const counts = `${errorCount} error(s), ${warningCount} warning(s) parsed`;
+      // A failed build whose cause is a write-permission error says so up front: the
+      // raw output names no cause, and a tail is easy to miss.
+      const blockedCause = ok ? undefined : describeWriteBlockedCause(result.output);
+      if (blockedCause !== undefined) notes.push(`xcodebuild hit ${blockedCause}`);
 
       return {
         ok,
-        summary: `${verdict} — ${counts}`,
+        summary: `${verdict}${blockedCause !== undefined ? ` — ${blockedCause}` : ''} — ${counts}`,
         command,
         target,
         ...(scheme !== undefined ? { scheme } : {}),
@@ -1675,11 +2100,18 @@ export function apply(ctx: Ctx, rawConfig?: unknown): () => void {
           notes: { type: 'array', items: { type: 'string' } },
         },
       },
-      render(_args: unknown, value: { summary: string }): unknown[] {
-        return [textBlock(value.summary)];
+      render(_args: unknown, value: { summary: string; notes?: unknown }): unknown[] {
+        // The model only sees these content blocks, so a note it must act on has
+        // to be rendered here rather than left in the structured field.
+        const notes = Array.isArray(value.notes) ? value.notes.filter(isNonEmptyString) : [];
+        const parts = [
+          value.summary,
+          notes.length > 0 ? `Notes:\n${notes.map((note) => `- ${note}`).join('\n')}` : undefined,
+        ].filter(isNonEmptyString);
+        return [textBlock(parts.join('\n\n'))];
       },
     },
-    async execute(args: Record<string, unknown>): Promise<Record<string, unknown>> {
+    async execute(args: Record<string, unknown>, _exec: ToolExecContext): Promise<Record<string, unknown>> {
       const cwd = resolveCwd(config, args.cwd);
       const notes: string[] = [];
       const discovered = await discoverProject(ctx, config, cwd);
@@ -1799,7 +2231,7 @@ export function apply(ctx: Ctx, rawConfig?: unknown): () => void {
         return [textBlock(parts.join('\n\n'))];
       },
     },
-    async execute(args: Record<string, unknown>, exec: { signal?: AbortSignal }): Promise<Record<string, unknown>> {
+    async execute(args: Record<string, unknown>, exec: ToolExecContext): Promise<Record<string, unknown>> {
       const cwd = resolveCwd(config, args.cwd);
       const notes: string[] = [];
       const timeoutMs = Math.floor(
@@ -1876,7 +2308,21 @@ export function apply(ctx: Ctx, rawConfig?: unknown): () => void {
           continue;
         }
 
-        if (outcome.timedOut) notes.push(`${command} exceeded ${timeoutMs} ms and was terminated`);
+        if (stoppedByBudget(outcome)) {
+          notes.push(`${command} exceeded ${timeoutMs} ms and was terminated`);
+        } else if (outlivedBudget(outcome)) {
+          notes.push(
+            `${command} exceeded ${timeoutMs} ms but had already finished on its own (exit ${String(outcome.exitCode)})`,
+          );
+        } else if (outcome.timedOut) {
+          notes.push(`${command} exceeded ${timeoutMs} ms and ended without reporting an exit status`);
+        }
+        if (outcome.quiescenceUnproven === true) {
+          notes.push(
+            `${plan.manager}: the process exited but its child processes were not confirmed gone within ` +
+              'the grace window',
+          );
+        }
         if (outcome.lossy) {
           notes.push(`${plan.manager} output overflowed the in-memory budget and some output was dropped`);
         }
@@ -1905,7 +2351,7 @@ export function apply(ctx: Ctx, rawConfig?: unknown): () => void {
           manager: plan.manager,
           manifest: plan.manifest,
           command,
-          ok: outcome.exitCode === 0 && !outcome.timedOut,
+          ok: outcome.exitCode === 0 && !stoppedByBudget(outcome),
           ...(outcome.exitCode !== null ? { exitCode: outcome.exitCode } : {}),
           elapsedMs,
           ...(tail.text.length > 0
@@ -1952,7 +2398,9 @@ export function apply(ctx: Ctx, rawConfig?: unknown): () => void {
       properties: {
         action: {
           type: 'string',
-          enum: ['list', 'boot', 'shutdown', 'booted', 'open', 'erase', 'delete', 'runtime_list'],
+          // Generated from the same set the executor validates against, so the
+          // advertised values and the accepted ones cannot drift apart.
+          enum: [...SIMULATOR_ACTIONS],
           description: 'The simctl operation to perform.',
         },
         device: {
@@ -1986,16 +2434,36 @@ export function apply(ctx: Ctx, rawConfig?: unknown): () => void {
           notes: { type: 'array', items: { type: 'string' } },
         },
       },
-      render(_args: unknown, value: { summary: string }): unknown[] {
-        return [textBlock(value.summary)];
+      render(_args: unknown, value: { summary: string; notes?: unknown }): unknown[] {
+        // The model only sees these content blocks, so a note it must act on has
+        // to be rendered here rather than left in the structured field.
+        const notes = Array.isArray(value.notes) ? value.notes.filter(isNonEmptyString) : [];
+        const parts = [
+          value.summary,
+          notes.length > 0 ? `Notes:\n${notes.map((note) => `- ${note}`).join('\n')}` : undefined,
+        ].filter(isNonEmptyString);
+        return [textBlock(parts.join('\n\n'))];
       },
     },
-    async execute(args: Record<string, unknown>): Promise<Record<string, unknown>> {
+    async execute(args: Record<string, unknown>, _exec: ToolExecContext): Promise<Record<string, unknown>> {
       const cwd = resolveCwd(config, args.cwd);
       const action = isNonEmptyString(args.action) ? args.action.trim() : 'list';
       const notes: string[] = [];
       const run = (argv: string[]): Promise<CommandResult> =>
         runCommand(ctx, config, { argv: [config.xcrunPath, 'simctl', ...argv], cwd, timeoutMs: config.simctlTimeoutMs });
+
+      // Validate before doing anything else: an unknown verb must not reach
+      // `simctl`, whose reply would be a usage dump naming no culprit.
+      if (!SIMULATOR_ACTIONS.has(action)) {
+        return {
+          ok: false,
+          action,
+          summary:
+            `unknown action ${JSON.stringify(action)}; valid actions are: ` +
+            `${[...SIMULATOR_ACTIONS].join(', ')}`,
+          notes,
+        };
+      }
 
       if (action === 'list') {
         const runtimeFilter = isNonEmptyString(args.runtime) ? args.runtime.trim() : undefined;
@@ -2019,7 +2487,7 @@ export function apply(ctx: Ctx, rawConfig?: unknown): () => void {
       if (action === 'booted') {
         const resolved = await resolveDevice(ctx, config, cwd, undefined);
         if (resolved.udid === undefined) {
-          return { ok: false, action, summary: resolved.note ?? 'no booted simulator', notes };
+          return { ok: false, action, summary: messageOr(resolved.note, 'no booted simulator'), notes };
         }
         const described = await run(['list', 'devices', 'booted', '-j']);
         const document = parseJsonObject(described.output);
@@ -2042,37 +2510,57 @@ export function apply(ctx: Ctx, rawConfig?: unknown): () => void {
 
       const resolved = await resolveDevice(ctx, config, cwd, args.device);
       if (resolved.udid === undefined) {
-        return { ok: false, action, summary: resolved.note ?? 'no matching simulator', notes };
+        return { ok: false, action, summary: messageOr(resolved.note, 'no matching simulator'), notes };
       }
       const udid = resolved.udid;
 
       if (action === 'open') {
         // `open -a Simulator` only fronts the UI; boot the device first so the
-        // window actually shows this simulator.
-        await run(['boot', udid]);
+        // window actually shows this simulator. The boot result used to be
+        // discarded, which let a failed boot still report "opened Simulator".
+        const booted = await run(['boot', udid]);
+        const bootFailed =
+          booted.exitCode !== 0 && !/current state:\s*Booted/i.test(booted.output);
+        if (bootFailed) {
+          notes.push(
+            `could not boot ${udid} before opening the Simulator app: ${bounded(booted.output, 500).text}`,
+          );
+        }
         const opened = await runCommand(ctx, config, {
           argv: ['/usr/bin/open', '-a', 'Simulator'],
           cwd,
           timeoutMs: 30000,
         });
         if (opened.exitCode !== 0) notes.push(bounded(opened.output, 500).text);
+        const ok = opened.exitCode === 0 && !bootFailed;
         return {
-          ok: opened.exitCode === 0,
+          ok,
           action,
-          summary: `opened Simulator with ${udid}`,
+          summary: ok
+            ? `opened Simulator with ${udid}`
+            : `could not open Simulator with ${udid}` +
+              (bootFailed ? ' (the device could not be booted)' : ' (the Simulator app did not launch)'),
           udid,
           ...(opened.exitCode !== null ? { exitCode: opened.exitCode } : {}),
           notes,
         };
       }
 
-      const simctlAction = action === 'boot' ? 'boot' : action;
-      const result = await run([simctlAction, udid]);
-      // Booting an already-booted device reports a benign "Unable to boot device
-      // in current state: Booted"; treat that as success.
-      const alreadyBooted = /current state:\s*Booted/i.test(result.output);
-      if (alreadyBooted) notes.push('device was already in the requested state');
-      const ok = result.exitCode === 0 || alreadyBooted;
+      const result = await run([action, udid]);
+      // simctl reports the benign "already there" case as an error: booting an
+      // already-booted device, and shutting down one that is already shut down
+      // (measured: CoreSimulator code 405, "current state: Shutdown", exit 149).
+      // Treat each as the success it is, but only for the state that action asks
+      // for — "current state: Booted" must never excuse a failed shutdown.
+      const benignState =
+        action === 'boot'
+          ? /current state:\s*Booted/i
+          : action === 'shutdown'
+            ? /current state:\s*Shutdown/i
+            : null;
+      const alreadyInState = benignState !== null && benignState.test(result.output);
+      if (alreadyInState) notes.push('device was already in the requested state');
+      const ok = result.exitCode === 0 || alreadyInState;
       const summary = bounded(
         ok
           ? `${action} ${udid}: ${result.output.trim().length > 0 ? result.output.trim() : 'ok'}`
@@ -2097,7 +2585,12 @@ export function apply(ctx: Ctx, rawConfig?: unknown): () => void {
       'Pass the `.app` product from an `xcode_build` run; `bundle_id` is required for launching and is ' +
       'optional when only installing.',
     isConcurrencySafe: () => false,
-    timeoutMs: config.simctlTimeoutMs + 30000,
+    // A ceiling, not a wait: boot (1x) + install with its one retry (2x) + launch
+    // (4x when `--console-pty` streams until the app exits) = 7x, plus slack.
+    // Declaring less than the worst case would let the harness cancel a call that
+    // is still legitimately working — the install retry below would then never be
+    // able to finish.
+    timeoutMs: config.simctlTimeoutMs * 7 + 30000,
     parameters: {
       type: 'object',
       properties: {
@@ -2137,11 +2630,18 @@ export function apply(ctx: Ctx, rawConfig?: unknown): () => void {
           notes: { type: 'array', items: { type: 'string' } },
         },
       },
-      render(_args: unknown, value: { summary: string }): unknown[] {
-        return [textBlock(value.summary)];
+      render(_args: unknown, value: { summary: string; notes?: unknown }): unknown[] {
+        // The model only sees these content blocks, so a note it must act on has
+        // to be rendered here rather than left in the structured field.
+        const notes = Array.isArray(value.notes) ? value.notes.filter(isNonEmptyString) : [];
+        const parts = [
+          value.summary,
+          notes.length > 0 ? `Notes:\n${notes.map((note) => `- ${note}`).join('\n')}` : undefined,
+        ].filter(isNonEmptyString);
+        return [textBlock(parts.join('\n\n'))];
       },
     },
-    async execute(args: Record<string, unknown>): Promise<Record<string, unknown>> {
+    async execute(args: Record<string, unknown>, _exec: ToolExecContext): Promise<Record<string, unknown>> {
       const cwd = resolveCwd(config, args.cwd);
       const notes: string[] = [];
       if (!isNonEmptyString(args.app_path)) {
@@ -2156,7 +2656,7 @@ export function apply(ctx: Ctx, rawConfig?: unknown): () => void {
 
       const resolved = await resolveDevice(ctx, config, cwd, args.device);
       if (resolved.udid === undefined) {
-        return { ok: false, summary: resolved.note ?? 'no matching simulator', appPath, notes };
+        return { ok: false, summary: messageOr(resolved.note, 'no matching simulator'), appPath, notes };
       }
       const udid = resolved.udid;
 
@@ -2170,22 +2670,72 @@ export function apply(ctx: Ctx, rawConfig?: unknown): () => void {
         notes.push(`boot reported: ${bounded(booted.output, 300).text}`);
       }
 
-      const installed = await runCommand(ctx, config, {
-        argv: [config.xcrunPath, 'simctl', 'install', udid, appPath],
+      // A large `.app` can take a long time to copy into the device container, so
+      // the install gets its own retry-and-report treatment: one retry on a
+      // recognised infrastructure flake (never on a timeout — that would just
+      // double the wait), an explicit timeout message, and the elapsed time so the
+      // caller can see whether the bundle is what made it slow.
+      const installArgv = [config.xcrunPath, 'simctl', 'install', udid, appPath];
+      const installStarted = Date.now();
+      let installed = await runCommand(ctx, config, {
+        argv: installArgv,
         cwd,
         timeoutMs: config.simctlTimeoutMs,
       });
-      if (installed.exitCode !== 0) {
+      if (
+        installed.exitCode !== 0 &&
+        !installed.timedOut &&
+        FLAKY_SIMCTL_PATTERN.test(installed.output)
+      ) {
+        notes.push(
+          'the install hit a simulator infrastructure flake; waiting 1s and retrying once ' +
+            `(matched ${bounded(installed.output, 200).text.trim()})`,
+        );
+        await new Promise((resolve) => setTimeout(resolve, 1000));
+        installed = await runCommand(ctx, config, {
+          argv: installArgv,
+          cwd,
+          timeoutMs: config.simctlTimeoutMs,
+        });
+      }
+      const installSeconds = ((Date.now() - installStarted) / 1000).toFixed(1);
+
+      if (stoppedByBudget(installed)) {
+        notes.push(
+          `the install exceeded simctlTimeoutMs (${config.simctlTimeoutMs} ms) and was terminated; a large ` +
+            '`.app` can need longer — raise simctlTimeoutMs in the plugin config',
+        );
         return {
           ok: false,
-          summary: `install failed: ${bounded(installed.output, 3000).text}`,
+          summary:
+            `install timed out after ${config.simctlTimeoutMs} ms (waited ${installSeconds}s in total ` +
+            'before being stopped); the bundle may be very large',
           appPath,
           udid,
           ...(bundleId !== undefined ? { bundleId } : {}),
           notes,
         };
       }
-      const lines = [`installed ${appPath} on ${udid}`];
+      if (outlivedBudget(installed)) {
+        // The budget expired, but the copy had already finished: calling that a
+        // failure would report a successful install as a timeout.
+        notes.push(
+          `the install exceeded simctlTimeoutMs (${config.simctlTimeoutMs} ms) but completed on its own ` +
+            `(exit ${String(installed.exitCode)})`,
+        );
+      }
+      if (installed.exitCode !== 0) {
+        return {
+          ok: false,
+          summary: `install failed: ${messageOr(bounded(installed.output, 3000).text, 'simctl install reported no output')}`,
+          appPath,
+          udid,
+          ...(bundleId !== undefined ? { bundleId } : {}),
+          ...(installed.exitCode !== null ? { exitCode: installed.exitCode } : {}),
+          notes,
+        };
+      }
+      const lines = [`installed ${appPath} on ${udid} in ${installSeconds}s`];
       if (!shouldLaunch || bundleId === undefined) {
         return { ok: true, summary: lines.join('\n'), appPath, udid, notes };
       }
@@ -2206,18 +2756,35 @@ export function apply(ctx: Ctx, rawConfig?: unknown): () => void {
           if (isNonEmptyString(entry)) launchArgv.push(entry);
         }
       }
+      const launchTimeoutMs = args.console === true ? config.simctlTimeoutMs * 4 : config.simctlTimeoutMs;
+      const launchStarted = Date.now();
       const launched = await runCommand(ctx, config, {
         argv: launchArgv,
         cwd,
-        timeoutMs: args.console === true ? config.simctlTimeoutMs * 4 : config.simctlTimeoutMs,
+        timeoutMs: launchTimeoutMs,
       });
+      const launchSeconds = ((Date.now() - launchStarted) / 1000).toFixed(1);
       const pidMatch = /:\s*(\d+)\s*$/.exec(launched.output.trim());
       const pid = pidMatch !== null ? Number(pidMatch[1]) : undefined;
       const ok = launched.exitCode === 0 || pid !== undefined;
+      const launchIsTimeout = stoppedByBudget(launched);
+      if (launchIsTimeout) {
+        notes.push(
+          `the launch exceeded ${launchTimeoutMs} ms and was terminated${
+            args.console === true ? ' (--console-pty keeps streaming until the app exits)' : ''
+          }; raise simctlTimeoutMs in the plugin config if the app needs longer to start`,
+        );
+      } else if (outlivedBudget(launched)) {
+        notes.push(
+          `the launch exceeded ${launchTimeoutMs} ms but finished on its own (exit ${String(launched.exitCode)})`,
+        );
+      }
       lines.push(
         ok
-          ? `launched ${bundleId}${pid !== undefined ? ` (pid ${pid})` : ''}`
-          : `launch failed: ${bounded(launched.output, 2000).text}`,
+          ? `launched ${bundleId}${pid !== undefined ? ` (pid ${pid})` : ''} in ${launchSeconds}s`
+          : launchIsTimeout
+            ? `launch timed out after ${launchTimeoutMs} ms`
+            : `launch failed: ${messageOr(bounded(launched.output, 2000).text, 'simctl launch reported no output')}`,
       );
       return {
         ok,
@@ -2297,7 +2864,7 @@ export function apply(ctx: Ctx, rawConfig?: unknown): () => void {
         return blocks;
       },
     },
-    async execute(args: Record<string, unknown>): Promise<Record<string, unknown>> {
+    async execute(args: Record<string, unknown>, _exec: ToolExecContext): Promise<Record<string, unknown>> {
       const cwd = resolveCwd(config, args.cwd);
       const notes: string[] = [];
 
@@ -2305,7 +2872,7 @@ export function apply(ctx: Ctx, rawConfig?: unknown): () => void {
       if (resolved.udid === undefined) {
         return {
           ok: false,
-          summary: resolved.note ?? 'no booted simulator; boot one with simulator_control first',
+          summary: messageOr(resolved.note, 'no booted simulator; boot one with simulator_control first'),
           notes,
         };
       }
@@ -2403,7 +2970,7 @@ export function apply(ctx: Ctx, rawConfig?: unknown): () => void {
         return [textBlock(parts.join('\n\n'))];
       },
     },
-    async execute(args: Record<string, unknown>): Promise<Record<string, unknown>> {
+    async execute(args: Record<string, unknown>, _exec: ToolExecContext): Promise<Record<string, unknown>> {
       const cwd = resolveCwd(config, args.cwd);
       const notes: string[] = [];
 
@@ -2411,7 +2978,7 @@ export function apply(ctx: Ctx, rawConfig?: unknown): () => void {
       if (resolved.udid === undefined) {
         return {
           ok: false,
-          summary: resolved.note ?? 'no booted simulator; boot one with simulator_control first',
+          summary: messageOr(resolved.note, 'no booted simulator; boot one with simulator_control first'),
           notes,
         };
       }
@@ -2571,7 +3138,7 @@ export function apply(ctx: Ctx, rawConfig?: unknown): () => void {
         return blocks;
       },
     },
-    async execute(args: Record<string, unknown>, exec: { signal?: AbortSignal }): Promise<Record<string, unknown>> {
+    async execute(args: Record<string, unknown>, exec: ToolExecContext): Promise<Record<string, unknown>> {
       const cwd = resolveCwd(config, args.cwd);
       const notes: string[] = [];
 
@@ -2589,7 +3156,7 @@ export function apply(ctx: Ctx, rawConfig?: unknown): () => void {
       if (resolved.udid === undefined) {
         return {
           ok: false,
-          summary: resolved.note ?? 'no booted simulator; boot one with simulator_control first',
+          summary: messageOr(resolved.note, 'no booted simulator; boot one with simulator_control first'),
           notes,
         };
       }
@@ -2748,7 +3315,7 @@ export function apply(ctx: Ctx, rawConfig?: unknown): () => void {
         return [textBlock(parts.join('\n\n'))];
       },
     },
-    async execute(args: Record<string, unknown>, exec: { signal?: AbortSignal }): Promise<Record<string, unknown>> {
+    async execute(args: Record<string, unknown>, exec: ToolExecContext): Promise<Record<string, unknown>> {
       const cwd = resolveCwd(config, args.cwd);
       const notes: string[] = [];
 
@@ -2756,7 +3323,7 @@ export function apply(ctx: Ctx, rawConfig?: unknown): () => void {
       if (resolved.udid === undefined) {
         return {
           ok: false,
-          summary: resolved.note ?? 'no booted simulator; boot one with simulator_control first',
+          summary: messageOr(resolved.note, 'no booted simulator; boot one with simulator_control first'),
           notes,
         };
       }

@@ -23,12 +23,12 @@
         xcodebuildPath: xcodebuild
         xcrunPath: xcrun
         # Incremental builds: one stable DerivedData path keeps repeat builds warm
-        # instead of cold. Left unset on purpose — the default is
-        # `.dsh/DerivedData` under the build's working directory, and that default
-        # is applied only once the directory already exists. Uncomment the line
-        # below to use it unconditionally (xcodebuild then creates it), which also
-        # means the next build is a full rebuild at the new location. Add `.dsh/`
-        # to the repository's .gitignore first so products stay untracked.
+        # instead of cold. The default `.dsh/DerivedData` (under the build's working
+        # directory) is applied automatically on every build — it does NOT need to
+        # exist first, and `xcodebuild` creates it. Set this key only to put
+        # products somewhere else; a per-call `derived_data_path` wins over it.
+        # Switching location costs one full rebuild. `.dsh/` is already in this
+        # repository's .gitignore, so products stay untracked.
         # derivedDataPath: .dsh/DerivedData
         # Where simulator_screenshot / simulator_tap write when no explicit `path`
         # is passed. Relative to `workspaceRoot`, created on demand; `<repo>/.dsh/`

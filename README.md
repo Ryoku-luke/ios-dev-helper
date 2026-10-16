@@ -311,9 +311,14 @@ you want that variant.
 Recovers the machine after an interrupted run — a cancelled build, a crashed Xcode, a
 simulator left behind. Three steps, all reported:
 
-1. **Leftover `xcodebuild` processes.** `pgrep -fl xcodebuild` is filtered to the ones
-   whose command line names **this** workspace or its DerivedData; anything else is
-   left alone and reported as such, so a build you started yourself in Xcode survives.
+1. **Leftover processes, in three classes.** `pgrep -fl` is asked for `xcodebuild`,
+   `simctl … log stream` and `idb_companion`; each finding is reported as
+   `[class] <pid> <command line>`, so the PID and the process are both visible. Only
+   `xcodebuild` names this workspace, so it is filtered to commands naming **this**
+   workspace or its DerivedData — anything else is left alone and said so, which is how
+   a build you started yourself in Xcode survives. The two simulator-scoped classes are
+   matched by device UDID instead (their command line never mentions a workspace), and
+   `idb_companion` is simulator-scoped by nature and respawns on demand.
    Termination is `SIGTERM`, then — after `graceMs`, the same grace the subprocess
    service gives a child — `SIGKILL` for anything still alive, which is then reported
    under `survived` rather than quietly called cleaned.

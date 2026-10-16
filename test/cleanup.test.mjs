@@ -33,10 +33,15 @@ function makeDerivedData() {
   return { root, freshDb, oldData, intermediates };
 }
 
-/** Spawn stub whose pgrep answers differ between the list and the post-SIGTERM check. */
-function cleanupSpawn({ pgrepLines, afterTermLines = [] }) {
+/**
+ * Spawn stub whose pgrep answers differ per searched pattern, and between the first
+ * sweep and the post-SIGTERM one. `pgrepLines` stays as the shorthand for the
+ * `xcodebuild` class the earlier tests were written against.
+ */
+function cleanupSpawn({ pgrepLines = [], afterTermLines = [], byClass, afterTermByClass = {} }) {
   const calls = [];
-  let pgrepCount = 0;
+  const sweeps = {};
+  const answers = byClass ?? { xcodebuild: pgrepLines };
   return {
     calls,
     spawn(spec) {
@@ -45,8 +50,18 @@ function cleanupSpawn({ pgrepLines, afterTermLines = [] }) {
       let text = '';
       let code = 0;
       if (line.includes('pgrep')) {
-        pgrepCount += 1;
-        const lines = pgrepCount === 1 ? pgrepLines : afterTermLines;
+        const pattern = spec.argv[spec.argv.length - 1];
+        sweeps[pattern] = (sweeps[pattern] ?? 0) + 1;
+        const source = sweeps[pattern] === 1 ? answers : afterTermByClass;
+        // Only the shorthand's own class may inherit `pgrepLines`/`afterTermLines`:
+        // answering another class with them invented processes that were never there.
+        const shorthand =
+          byClass === undefined && pattern === 'xcodebuild'
+            ? sweeps[pattern] === 1
+              ? pgrepLines
+              : afterTermLines
+            : [];
+        const lines = source[pattern] ?? shorthand;
         text = lines.length > 0 ? `${lines.join('\n')}\n` : '';
         code = lines.length > 0 ? 0 : 1; // pgrep exits 1 when nothing matches
       } else if (line.includes('list devices')) {
@@ -190,4 +205,55 @@ test('the whole cleanup can be cancelled', async () => {
   controller.abort();
   await pending;
   assert.ok(spawned > 0, 'the cleanup must have started');
+});
+
+test('finds simulator-scoped leftovers too, naming each class and PID', async () => {
+  const cwd = makeWorkspace();
+  const dd = makeDerivedData();
+  const udid = 'D5969669-0A75-417B-87F8-5525A82A94A8';
+  const spark = {
+    xcodebuild: [`101 /usr/bin/xcodebuild -project ${join(cwd, 'X.xcodeproj')}`],
+    'simctl.*log stream': [`202 xcrun simctl spawn ${udid} log stream --level=debug`],
+    idb_companion: [`303 /Users/x/.dsh/tools/idb/bin/idb_companion --udid ${udid}`],
+  };
+  const config = { workspaceRoot: cwd, derivedDataPath: dd.root, graceMs: 50 };
+
+  const reporting = cleanupSpawn({ byClass: spark });
+  const report = await makeContext({ spawn: reporting.spawn, config })
+    .tool('cleanup_environment')
+    .execute({ cwd }, { signal: signal() });
+  assert.equal(report.processes.length, 3, 'every class is reported');
+  for (const [name, pid] of [['xcodebuild', 101], ['simctl log stream', 202], ['idb_companion', 303]]) {
+    const entry = report.processes.find((line) => line.includes(name));
+    assert.ok(entry !== undefined, `${name} must be listed`);
+    assert.match(String(entry), new RegExp(`\\[${name}\\] ${pid} `), 'the class and the PID are named');
+  }
+  assert.match(String(report.summary), /3 classes \(xcodebuild, simctl log stream, idb_companion\)/);
+  assert.ok(!reporting.calls.some((line) => line.includes('/bin/kill')), 'report only signals nothing');
+
+  const acting = cleanupSpawn({ byClass: spark });
+  const value = await makeContext({ spawn: acting.spawn, config })
+    .tool('cleanup_environment')
+    .execute({ cwd, auto_clean: true }, { signal: signal() });
+  const term = acting.calls.filter((line) => line.includes('-TERM')).join(' ');
+  for (const pid of [101, 202, 303]) {
+    assert.match(term, new RegExp(`\\b${pid}\\b`), `SIGTERM must reach ${pid}`);
+  }
+  assert.equal(value.terminated, 3);
+});
+
+test('leaves a log stream alone when its command line names no device', async () => {
+  const cwd = makeWorkspace();
+  const dd = makeDerivedData();
+  const stub = cleanupSpawn({
+    byClass: { 'simctl.*log stream': ['404 xcrun simctl log stream --help'], idb_companion: [] },
+  });
+  const value = await makeContext({
+    spawn: stub.spawn,
+    config: { workspaceRoot: cwd, derivedDataPath: dd.root, graceMs: 50 },
+  })
+    .tool('cleanup_environment')
+    .execute({ cwd, auto_clean: true }, { signal: signal() });
+  assert.equal(value.processes.length, 0, 'a device-less match is not ours');
+  assert.equal(value.terminated, 0);
 });

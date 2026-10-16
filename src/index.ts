@@ -3754,6 +3754,8 @@ export function apply(ctx: Ctx, rawConfig?: unknown): () => void {
     name: 'cleanup_environment',
     description:
       'Recover the machine after an interrupted iOS run: terminate leftover `xcodebuild` processes that ' +
+      'belong to this workspace, plus simulator-scoped `simctl … log stream` and `idb_companion` processes ' +
+      'left behind by an interrupted run (those are matched by device UDID, since their command line never ' +
       'belong to this workspace, drop stale DerivedData build-database/lock artifacts, and shut down every ' +
       'booted simulator. **It only reports unless `auto_clean: true`.** An `xcodebuild` whose command line ' +
       'does not name this workspace or DerivedData is never touched, so a build you started yourself in ' +
@@ -3903,44 +3905,95 @@ export function apply(ctx: Ctx, rawConfig?: unknown): () => void {
           .map((line) => Number(line.split(/\s+/)[0]))
           .filter((pid) => Number.isInteger(pid) && pid > 0);
 
-      // ---- 1. leftover xcodebuild processes ---------------------------------
-      const all = await listXcodebuild();
-      // Only ours: the command line has to name this workspace or its DerivedData.
-      const ours = all.filter(
-        (line) => line.includes(cwd) || (derivedData !== undefined && line.includes(derivedData)),
-      );
-      const foreign = all.length - ours.length;
-      if (foreign > 0) {
+      // ---- 1. leftover build and simulator processes -------------------------
+      const uuidPattern =
+        /[0-9A-Fa-f]{8}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{12}/;
+      /**
+       * The process classes worth looking for, and how to tell ours from someone else's.
+       *
+       * Only `xcodebuild` names this workspace on its command line. The simulator-scoped
+       * ones name a device instead, so their ownership is inferred from the UDID and
+       * reported as inferred rather than pretended: a `log stream` or an `idb_companion`
+       * left behind is exactly what wedges a simulator, and both respawn on demand.
+       */
+      const classes: Array<{ name: string; pattern: string; owns: (line: string) => boolean }> = [
+        {
+          name: 'xcodebuild',
+          pattern: 'xcodebuild',
+          owns: (line) => line.includes(cwd) || (derivedData !== undefined && line.includes(derivedData)),
+        },
+        { name: 'simctl log stream', pattern: 'simctl.*log stream', owns: (line) => uuidPattern.test(line) },
+        { name: 'idb_companion', pattern: 'idb_companion', owns: () => true },
+      ];
+
+      /** `pgrep -fl <pattern>` lines; an empty list also covers "nothing matched" (exit 1). */
+      const listPattern = async (pattern: string): Promise<string[]> => {
+        const listed = await call(['/usr/bin/pgrep', '-fl', pattern], 15000);
+        if (listed.unavailable) {
+          notes.push(`could not list processes: ${bounded(listed.output, 300).text}`);
+          return [];
+        }
+        return listed.output
+          .split('\n')
+          .map((line) => line.trim())
+          .filter((line) => line.length > 0 && /^\d+\s/.test(line));
+      };
+      /** One sweep of every class; `foreign` keeps what belongs to somebody else. */
+      const scan = async (): Promise<{
+        leftovers: Array<{ className: string; line: string; pid: number }>;
+        foreign: string[];
+      }> => {
+        const leftovers: Array<{ className: string; line: string; pid: number }> = [];
+        const foreign: string[] = [];
+        for (const klass of classes) {
+          for (const line of await listPattern(klass.pattern)) {
+            const pid = Number(line.split(/\s+/)[0]);
+            if (!Number.isInteger(pid) || pid <= 0) continue;
+            if (klass.owns(line)) leftovers.push({ className: klass.name, line, pid });
+            else foreign.push(`[${klass.name}] ${line}`);
+          }
+        }
+        return { leftovers, foreign };
+      };
+
+      const firstSweep = await scan();
+      const leftovers = firstSweep.leftovers;
+      const foreignXcodebuild = firstSweep.foreign.filter((line) => line.startsWith('[xcodebuild]')).length;
+      if (foreignXcodebuild > 0) {
         notes.push(
-          `${foreign} other \`xcodebuild\` process(es) were left alone — their command line does not ` +
-            'name this workspace or its DerivedData',
+          `${String(foreignXcodebuild)} other \`xcodebuild\` process(es) were left alone — their command ` +
+            'line does not name this workspace or its DerivedData',
         );
       }
       const terminated: string[] = [];
       const survived: string[] = [];
-      if (args.kill_processes !== false && autoClean && ours.length > 0) {
-        const pids = pidsOf(ours);
-        if (pids.length > 0) {
-          await call(['/bin/kill', '-TERM', ...pids.map(String)], 15000);
-          // The same grace the subprocess service gives a child between SIGTERM and
-          // SIGKILL: long enough for xcodebuild to flush, short enough to not stall.
-          await new Promise((resolve) => setTimeout(resolve, config.graceMs));
-          const remaining = pidsOf(await listXcodebuild()).filter((pid) => pids.includes(pid));
-          if (remaining.length > 0) {
-            await call(['/bin/kill', '-KILL', ...remaining.map(String)], 15000);
-            await new Promise((resolve) => setTimeout(resolve, 200));
-          }
-          const afterKill = pidsOf(await listXcodebuild()).filter((pid) => pids.includes(pid));
-          for (const pid of pids) {
-            const line = ours.find((entry) => entry.startsWith(`${String(pid)} `)) ?? String(pid);
-            if (afterKill.includes(pid)) survived.push(line);
-            else terminated.push(line);
-          }
-          notes.push(
-            `sent SIGTERM to ${pids.length} process(es), then SIGKILL to ${remaining.length} that were ` +
-              `still alive after ${config.graceMs} ms`,
-          );
+      if (args.kill_processes !== false && autoClean && leftovers.length > 0) {
+        const pids = [...new Set(leftovers.map((entry) => entry.pid))];
+        await call(['/bin/kill', '-TERM', ...pids.map(String)], 15000);
+        // The same grace the subprocess service gives a child between SIGTERM and
+        // SIGKILL: long enough for xcodebuild to flush, short enough to not stall.
+        await new Promise((resolve) => setTimeout(resolve, config.graceMs));
+        const stillThere = new Set((await scan()).leftovers.map((entry) => entry.pid));
+        const remaining = pids.filter((pid) => stillThere.has(pid));
+        if (remaining.length > 0) {
+          await call(['/bin/kill', '-KILL', ...remaining.map(String)], 15000);
+          await new Promise((resolve) => setTimeout(resolve, 200));
         }
+        const afterKill = new Set((await scan()).leftovers.map((entry) => entry.pid));
+        for (const entry of leftovers) {
+          const labelled = `[${entry.className}] ${entry.line}`;
+          if (afterKill.has(entry.pid)) survived.push(labelled);
+          else terminated.push(labelled);
+        }
+        notes.push(
+          `sent SIGTERM to ${String(pids.length)} process(es) across ${String(classes.length)} classes, ` +
+            `then SIGKILL to ${String(remaining.length)} that were still alive after ${String(config.graceMs)} ms`,
+        );
+      } else if (leftovers.length > 0) {
+        notes.push(
+          `found ${String(leftovers.length)} leftover process(es); nothing was signalled because ` +
+            (args.kill_processes === false ? '`kill_processes` is false' : '`auto_clean` is not true'),
+        );
       }
 
       // ---- 2. stale DerivedData build state ---------------------------------
@@ -4013,7 +4066,8 @@ export function apply(ctx: Ctx, rawConfig?: unknown): () => void {
       }
 
       const found =
-        `${ours.length} leftover \`xcodebuild\` process(es), ` +
+        `${String(leftovers.length)} leftover process(es) across ${String(classes.length)} classes ` +
+        `(${classes.map((klass) => klass.name).join(', ')}), ` +
         `${String(removable.length)} removable build-state artifact(s) of ${String(artifacts.length)} found, ` +
         `${String(bootedSimulators.length)} booted simulator(s)`;
       return {
@@ -4023,7 +4077,7 @@ export function apply(ctx: Ctx, rawConfig?: unknown): () => void {
           ? `cleanup done: terminated ${String(terminated.length)}, force-killed ${String(survived.length)}, ` +
             `removed ${String(removedArtifacts.length)} artifact(s), simulators shut down: ${shutdownDone ? 'yes' : 'no'}`
           : `report only — found ${found}; re-run with \`auto_clean: true\` to clean, or keep this as the record`,
-        processes: ours,
+        processes: leftovers.map((entry) => `[${entry.className}] ${entry.line}`),
         terminated: terminated.length,
         forceKilled: survived.length,
         survived,

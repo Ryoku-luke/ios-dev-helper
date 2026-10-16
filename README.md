@@ -300,6 +300,30 @@ credentialed request per verification to duplicate a judgement the calling model
 already making — and it silently changes whose opinion the verdict is. Say the word if
 you want that variant.
 
+### `cleanup_environment`
+
+Recovers the machine after an interrupted run — a cancelled build, a crashed Xcode, a
+simulator left behind. Three steps, all reported:
+
+1. **Leftover `xcodebuild` processes.** `pgrep -fl xcodebuild` is filtered to the ones
+   whose command line names **this** workspace or its DerivedData; anything else is
+   left alone and reported as such, so a build you started yourself in Xcode survives.
+   Termination is `SIGTERM`, then — after `graceMs`, the same grace the subprocess
+   service gives a child — `SIGKILL` for anything still alive, which is then reported
+   under `survived` rather than quietly called cleaned.
+2. **Stale DerivedData build state.** The walk looks for the artifacts Xcode actually
+   leaves behind (measured on a real DerivedData: `Build/Intermediates.noindex/
+   XCBuildData/build.db` plus a `<hash>.xcbuilddata` directory) together with
+   `*.lock`/`*.lockfile`, and deletes only what has been untouched for
+   `stale_minutes` (default 30) — so an in-flight build's database is protected by the
+   rule, not by luck. `remove_build_database: true` takes them regardless, at the cost
+   of the next build's incremental state.
+3. **Booted simulators.** `simctl shutdown all`, with the devices that were booted
+   reported first.
+
+**It only reports unless `confirm: true`.** Run it once without `confirm` to see what
+it would do; that report is also the record of what was left behind.
+
 ### `simulator_logs`
 
 Listens to the booted simulator's unified log with
@@ -457,8 +481,12 @@ dsh plugin --profile "$DSH_PROFILE" install /path/to/Tools/ios-dev-helper
 ## Notes and limits
 
 - **Cancellation reaches the child**: the host's abort signal is forwarded to every
-  spawned command, so cancelling a tool call terminates what it started instead of
-  leaving a build, install or `log stream` running. A tool that has already been
+  spawned command (or, for the simulator tools, `process.terminate()`), so cancelling a
+  tool call terminates what it started instead of leaving a build, install or `log stream`
+  running — and `runCommand` now waits for the process range to be really quiescent on
+  that path too, not only on a timeout, so a cancelled `xcodebuild` cannot leave compiler
+  children holding the build database after the tool has answered. If that quiescence
+  cannot be proven within `graceMs + 2000` ms, the result says so instead of pretending. A tool that has already been
   cancelled may still spawn follow-up commands; those arrive pre-aborted and are
   killed immediately, and `simulator_install_launch` never retries after a cancel.
 - **Sandbox**: these tools spawn processes with the harness process's own

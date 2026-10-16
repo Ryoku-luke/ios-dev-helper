@@ -207,3 +207,36 @@ test('still counts upper-case and lower-case severities the same way', async () 
   assert.equal(value.ok, false);
   assert.match(String(value.diagnostics), /^- \/src\/A\.swift:1:2: error: upper case error$/m);
 });
+
+test('recommends cleanup_environment after three consecutive failures, and forgets on success', async () => {
+  const cwd = makeWorkspace();
+  const failing = () =>
+    makeContext({
+      outputs: [['xcodebuild', { text: 'error: cannot write to the build database\n** BUILD FAILED **\n', code: 65 }]],
+      config: { treatWarningsAsErrors: false },
+    });
+  const call = (context) =>
+    context.tool('xcode_build').execute({ target: 'X.xcodeproj', scheme: 'S', cwd }, { signal: signal() });
+
+  const first = failing();
+  assert.equal((await call(first)).hint, undefined, 'one failure is not a pattern');
+  await call(first);
+  const third = await call(first);
+  assert.equal(third.ok, false);
+  assert.match(String(third.hint), /检测到连续失败 3 次，建议调用 cleanup_environment 清理缓存/);
+  assert.equal(third.consecutiveFailures, 3);
+  // The reminder must be the last thing the model reads, not folded into the summary.
+  const blocks = first.tool('xcode_build').output.render({}, third);
+  assert.match(String(blocks[blocks.length - 1].text), /cleanup_environment/);
+  // The counter is declared in the output schema, so the contract stays honest.
+  assert.ok(first.tool('xcode_build').output.schema.properties.hint !== undefined);
+
+  // A success clears the run.
+  const succeeding = makeContext({
+    outputs: [['xcodebuild', { text: '** BUILD SUCCEEDED **\n' }]],
+    config: { treatWarningsAsErrors: false },
+  });
+  await call(succeeding);
+  const afterSuccess = await call(succeeding);
+  assert.equal(afterSuccess.hint, undefined, 'a success resets the streak');
+});

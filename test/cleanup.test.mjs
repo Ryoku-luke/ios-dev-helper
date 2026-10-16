@@ -78,7 +78,7 @@ test('reports without confirm and changes nothing', async () => {
   });
   const value = await tool('cleanup_environment').execute({ cwd }, { signal: signal() });
 
-  assert.equal(value.confirmed, false);
+  assert.equal(value.autoClean, false);
   assert.equal(value.processes.length, 1);
   assert.match(String(value.summary), /report only/);
   assert.equal(value.terminated, 0);
@@ -99,7 +99,7 @@ test('escalates a SIGTERM-ignoring process to SIGKILL', async () => {
     spawn: stub.spawn,
     config: { workspaceRoot: cwd, derivedDataPath: dd.root, graceMs: 50 },
   });
-  const value = await tool('cleanup_environment').execute({ cwd, confirm: true }, { signal: signal() });
+  const value = await tool('cleanup_environment').execute({ cwd, auto_clean: true }, { signal: signal() });
 
   const kills = stub.calls.filter((line) => line.includes('/bin/kill'));
   assert.equal(kills.length, 2, 'SIGTERM then SIGKILL');
@@ -121,7 +121,7 @@ test('never touches an xcodebuild that is not ours', async () => {
     spawn: stub.spawn,
     config: { workspaceRoot: cwd, derivedDataPath: dd.root, graceMs: 50 },
   });
-  const value = await tool('cleanup_environment').execute({ cwd, confirm: true }, { signal: signal() });
+  const value = await tool('cleanup_environment').execute({ cwd, auto_clean: true }, { signal: signal() });
   assert.equal(value.processes.length, 1);
   assert.match(String(value.processes[0]), /X\.xcodeproj/);
   assert.ok((value.notes ?? []).some((note) => /left alone/.test(note)));
@@ -139,14 +139,14 @@ test('removes only stale artifacts unless asked for the build database', async (
   };
 
   const cautious = makeContext(base);
-  const first = await cautious.tool('cleanup_environment').execute({ cwd, confirm: true }, { signal: signal() });
+  const first = await cautious.tool('cleanup_environment').execute({ cwd, auto_clean: true }, { signal: signal() });
   assert.equal(first.artifacts.length, 1, 'only the stale artifact is eligible');
   assert.equal(existsSync(dd.oldData), false, 'the stale artifact is gone');
   assert.equal(existsSync(dd.freshDb), true, 'a fresh build database survives by default');
 
   const forced = makeContext(base);
   const second = await forced.tool('cleanup_environment').execute(
-    { cwd, confirm: true, remove_build_database: true },
+    { cwd, auto_clean: true, remove_build_database: true },
     { signal: signal() },
   );
   assert.ok(second.artifacts.some((path) => path.endsWith('build.db')));
@@ -179,7 +179,7 @@ test('the whole cleanup can be cancelled', async () => {
       };
     },
   });
-  const pending = tool('cleanup_environment').execute({ cwd, confirm: true }, { signal: controller.signal });
+  const pending = tool('cleanup_environment').execute({ cwd, auto_clean: true }, { signal: controller.signal });
   await new Promise((resolve) => setImmediate(resolve));
   controller.abort();
   await pending;

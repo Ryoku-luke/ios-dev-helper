@@ -159,6 +159,12 @@ matching only lowercase silently reported a run it had warned about as
 - Marks the build not-ok when `warningCount > 0` **and** `treatWarningsAsErrors`
   is on, mirroring this repository's `Tools/run_tests.sh` rule that compiler
   warnings are failures.
+- **Three failures in a row and the result recommends a cleanup.** `xcode_build` counts
+  consecutive failures per working directory and appends a final block to the result,
+  "检测到连续失败 N 次，建议调用 cleanup_environment 清理缓存" — because a project that
+  built a minute ago and now will not is usually a leftover `xcodebuild` or a wedged
+  DerivedData database rather than a code problem. A successful build clears the streak,
+  and the counter lives with the plugin instance (a reload resets it).
 - **A test run that executes no test is a failure, not a pass.** `xcodebuild`
   exits 0 and prints `** TEST SUCCEEDED **` even when a filter matched nothing
   (`Executed 0 tests`), so the tool reads the `Executed N test(s)` count and
@@ -321,8 +327,8 @@ simulator left behind. Three steps, all reported:
 3. **Booted simulators.** `simctl shutdown all`, with the devices that were booted
    reported first.
 
-**It only reports unless `confirm: true`.** Run it once without `confirm` to see what
-it would do; that report is also the record of what was left behind.
+**It only reports unless `auto_clean: true`.** Run it once without it to see what would
+be done; that report is also the record of what was left behind.
 
 ### `simulator_logs`
 

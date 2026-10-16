@@ -260,6 +260,9 @@ function readPluginVersion(): string {
 const PLUGIN_VERSION = readPluginVersion();
 const VERSION_STAMP = `[ios-dev-helper v${PLUGIN_VERSION}]`;
 
+/** Consecutive \`xcode_build\` failures before the result starts recommending a cleanup. */
+const CONSECUTIVE_BUILD_FAILURES = 3;
+
 /** Payload of the SwiftUI/HIG system-prompt section owned by this plugin. */
 const SWIFTUI_GUIDANCE = `## iOS development conventions (ios-dev-helper v${PLUGIN_VERSION})
 
@@ -1627,15 +1630,92 @@ export function apply(ctx: Ctx, rawConfig?: unknown): () => void {
    * a tool added later cannot forget it: the stamp is what makes a stale Host
    * (serving a cached module) distinguishable from a reloaded one.
    */
+  /** Consecutive \`xcode_build\` failures per working directory; cleared on success. */
+  const buildFailureCounts = new Map<string, number>();
+
+  /**
+   * Add the consecutive-failure reminder to \`xcode_build\`.
+   *
+   * A project that built a minute ago and now will not is usually not a code problem: a
+   * leftover \`xcodebuild\` or a wedged DerivedData database is. Counting at registration
+   * covers every return path of the tool, and declaring the extra fields here keeps its
+   * declared output schema honest about what it can return.
+   *
+   * @param definition The registration about to be installed.
+   * @returns The same definition, wrapped.
+   */
+  const withConsecutiveFailureHint = (
+    definition: Record<string, unknown>,
+  ): Record<string, unknown> => {
+    const output = definition.output as
+      | { schema?: Record<string, unknown>; render?: (...args: unknown[]) => unknown[] }
+      | undefined;
+    const schema = output?.schema;
+    const properties =
+      schema !== undefined && typeof schema.properties === 'object' && schema.properties !== null
+        ? (schema.properties as Record<string, unknown>)
+        : undefined;
+    const originalExecute = definition.execute as
+      | ((args: Record<string, unknown>, exec: ToolExecContext) => Promise<Record<string, unknown>>)
+      | undefined;
+    const originalRender = output?.render;
+    if (originalExecute === undefined || schema === undefined || properties === undefined) {
+      return definition;
+    }
+    return {
+      ...definition,
+      output: {
+        ...output,
+        schema: {
+          ...schema,
+          properties: {
+            ...properties,
+            hint: { type: 'string' },
+            consecutiveFailures: { type: 'integer' },
+          },
+        },
+        // Rendered as a final block rather than folded into the existing text, so the
+        // reminder cannot be lost inside a truncated build tail.
+        render: (...renderArgs: unknown[]): unknown[] => {
+          const blocks = originalRender === undefined ? [] : originalRender(...renderArgs);
+          const value = renderArgs[1] as { hint?: unknown } | undefined;
+          const hint = typeof value?.hint === 'string' ? value.hint : undefined;
+          return hint === undefined ? blocks : [...blocks, textBlock(hint)];
+        },
+      },
+      async execute(args: Record<string, unknown>, exec: ToolExecContext): Promise<Record<string, unknown>> {
+        const result = await originalExecute(args, exec);
+        const key = resolveCwd(config, args.cwd);
+        if (result.ok === true) {
+          buildFailureCounts.delete(key);
+          return result;
+        }
+        const failures = (buildFailureCounts.get(key) ?? 0) + 1;
+        buildFailureCounts.set(key, failures);
+        if (failures < CONSECUTIVE_BUILD_FAILURES) return result;
+        return {
+          ...result,
+          consecutiveFailures: failures,
+          hint:
+            `检测到连续失败 ${failures} 次，建议调用 cleanup_environment 清理缓存` +
+            '（残留的 xcodebuild 进程或 DerivedData 构建数据库可能仍在阻塞构建）',
+        };
+      },
+    };
+  };
+
   const register = (definition: Record<string, unknown>): void => {
     const description = typeof definition.description === 'string' ? definition.description : '';
+    const stamped = {
+      ...definition,
+      description: description.includes(VERSION_STAMP)
+        ? description
+        : `${description} ${VERSION_STAMP}`.trim(),
+    };
     disposers.push(
-      ctx.tools.register({
-        ...definition,
-        description: description.includes(VERSION_STAMP)
-          ? description
-          : `${description} ${VERSION_STAMP}`.trim(),
-      }),
+      ctx.tools.register(
+        definition.name === 'xcode_build' ? withConsecutiveFailureHint(stamped) : stamped,
+      ),
     );
   };
 
@@ -3675,7 +3755,7 @@ export function apply(ctx: Ctx, rawConfig?: unknown): () => void {
     description:
       'Recover the machine after an interrupted iOS run: terminate leftover `xcodebuild` processes that ' +
       'belong to this workspace, drop stale DerivedData build-database/lock artifacts, and shut down every ' +
-      'booted simulator. **It only reports unless `confirm: true`.** An `xcodebuild` whose command line ' +
+      'booted simulator. **It only reports unless `auto_clean: true`.** An `xcodebuild` whose command line ' +
       'does not name this workspace or DerivedData is never touched, so a build you started yourself in ' +
       'Xcode elsewhere survives. Termination is SIGTERM, then SIGKILL for anything still alive after ' +
       '`graceMs` (the same grace the subprocess service uses). Artifacts are only deleted once they are ' +
@@ -3688,11 +3768,12 @@ export function apply(ctx: Ctx, rawConfig?: unknown): () => void {
     parameters: {
       type: 'object',
       properties: {
-        confirm: {
+        auto_clean: {
           type: 'boolean',
           description:
-            'Actually act. Defaults to false, which reports what would be cleaned without changing ' +
-            'anything — always worth one report-only run first.',
+            'Actually clean. Defaults to false, which only reports what would be removed — always worth ' +
+            'one report-only run first. Set it to true to terminate the leftovers, delete the artifacts ' +
+            'and shut the simulators down.',
         },
         cwd: {
           type: 'string',
@@ -3732,7 +3813,7 @@ export function apply(ctx: Ctx, rawConfig?: unknown): () => void {
         properties: {
           ok: { type: 'boolean' },
           summary: { type: 'string' },
-          confirmed: { type: 'boolean' },
+          autoClean: { type: 'boolean' },
           processes: { type: 'array', items: { type: 'string' } },
           terminated: { type: 'integer' },
           forceKilled: { type: 'integer' },
@@ -3776,7 +3857,7 @@ export function apply(ctx: Ctx, rawConfig?: unknown): () => void {
     },
     async execute(args: Record<string, unknown>, exec: ToolExecContext): Promise<Record<string, unknown>> {
       const cwd = resolveCwd(config, args.cwd);
-      const confirm = args.confirm === true;
+      const autoClean = args.auto_clean === true;
       const notes: string[] = [];
       const call = (
         argv: string[],
@@ -3834,7 +3915,7 @@ export function apply(ctx: Ctx, rawConfig?: unknown): () => void {
       }
       const terminated: string[] = [];
       const survived: string[] = [];
-      if (args.kill_processes !== false && confirm && ours.length > 0) {
+      if (args.kill_processes !== false && autoClean && ours.length > 0) {
         const pids = pidsOf(ours);
         if (pids.length > 0) {
           await call(['/bin/kill', '-TERM', ...pids.map(String)], 15000);
@@ -3894,7 +3975,7 @@ export function apply(ctx: Ctx, rawConfig?: unknown): () => void {
       const stale = artifacts.filter((artifact) => artifact.mtimeMs <= staleBefore);
       const removable = args.remove_build_database === true ? artifacts : stale;
       const removedArtifacts: string[] = [];
-      if (confirm) {
+      if (autoClean) {
         for (const artifact of removable) {
           try {
             rmSync(artifact.path, { recursive: artifact.kind === 'dir', force: true });
@@ -3922,7 +4003,7 @@ export function apply(ctx: Ctx, rawConfig?: unknown): () => void {
         }
       }
       let shutdownDone = false;
-      if (args.shutdown_simulators !== false && confirm && bootedSimulators.length > 0) {
+      if (args.shutdown_simulators !== false && autoClean && bootedSimulators.length > 0) {
         const stopped = await call([config.xcrunPath, 'simctl', 'shutdown', 'all'], config.simctlTimeoutMs);
         shutdownDone = !stopped.unavailable && stopped.exitCode === 0;
         if (!shutdownDone) notes.push(`\`simctl shutdown all\` failed: ${bounded(stopped.output, 300).text}`);
@@ -3934,8 +4015,8 @@ export function apply(ctx: Ctx, rawConfig?: unknown): () => void {
         `${String(bootedSimulators.length)} booted simulator(s)`;
       return {
         ok: true,
-        confirmed: confirm,
-        summary: confirm
+        autoClean,
+        summary: autoClean
           ? `cleanup done: terminated ${String(terminated.length)}, force-killed ${String(survived.length)}, ` +
             `removed ${String(removedArtifacts.length)} artifact(s), simulators shut down: ${shutdownDone ? 'yes' : 'no'}`
           : `report only — found ${found}; re-run with \`confirm: true\` to clean, or keep this as the record`,

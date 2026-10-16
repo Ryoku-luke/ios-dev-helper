@@ -91,7 +91,14 @@ test('phase 2 answers { passed: false, reason, nextSteps } and says what to do n
   assert.match(steps, /simulator_elements/, 'the caller is told how to see what is actually on screen');
   assert.match(steps, /xcode_build/, 'the caller is told to rebuild after a fix');
   assert.match(steps, /simulator_install_launch/);
-  assert.match(render(tool('ios_verify_ui'), value), /未发现日期选择器/);
+  const rendered = render(tool('ios_verify_ui'), value);
+  assert.match(rendered, /未发现日期选择器/);
+  assert.equal(
+    (rendered.match(/未发现日期选择器/g) ?? []).length,
+    1,
+    'the reason must be printed once, not once in the summary and again in the render',
+  );
+  assert.match(rendered, /acceptance criteria NOT met/);
 });
 
 test('a failure without a reason is refused, because it cannot be acted on', async () => {

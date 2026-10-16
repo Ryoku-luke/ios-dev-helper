@@ -3819,6 +3819,7 @@ export function apply(ctx: Ctx, rawConfig?: unknown): () => void {
           forceKilled: { type: 'integer' },
           survived: { type: 'array', items: { type: 'string' } },
           artifacts: { type: 'array', items: { type: 'string' } },
+          foundArtifacts: { type: 'array', items: { type: 'string' } },
           removedArtifacts: { type: 'array', items: { type: 'string' } },
           bootedSimulators: { type: 'array', items: { type: 'string' } },
           notes: { type: 'array', items: { type: 'string' } },
@@ -3830,6 +3831,7 @@ export function apply(ctx: Ctx, rawConfig?: unknown): () => void {
           summary: string;
           processes?: unknown;
           artifacts?: unknown;
+          foundArtifacts?: unknown;
           removedArtifacts?: unknown;
           bootedSimulators?: unknown;
           survived?: unknown;
@@ -3846,7 +3848,8 @@ export function apply(ctx: Ctx, rawConfig?: unknown): () => void {
         const parts = [
           value.summary,
           section('Leftover processes', list(value.processes)),
-          section('Build-state artifacts', list(value.artifacts)),
+          section('Build-state artifacts found', list(value.foundArtifacts)),
+          section('Would remove', list(value.artifacts)),
           section('Removed', list(value.removedArtifacts)),
           section('Booted simulators', list(value.bootedSimulators)),
           section('Still alive after SIGKILL', list(value.survived)),
@@ -4019,12 +4022,13 @@ export function apply(ctx: Ctx, rawConfig?: unknown): () => void {
         summary: autoClean
           ? `cleanup done: terminated ${String(terminated.length)}, force-killed ${String(survived.length)}, ` +
             `removed ${String(removedArtifacts.length)} artifact(s), simulators shut down: ${shutdownDone ? 'yes' : 'no'}`
-          : `report only — found ${found}; re-run with \`confirm: true\` to clean, or keep this as the record`,
+          : `report only — found ${found}; re-run with \`auto_clean: true\` to clean, or keep this as the record`,
         processes: ours,
         terminated: terminated.length,
         forceKilled: survived.length,
         survived,
         artifacts: removable.map((artifact) => artifact.path),
+        foundArtifacts: artifacts.map((artifact) => artifact.path),
         removedArtifacts,
         bootedSimulators,
         notes,

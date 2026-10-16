@@ -81,6 +81,12 @@ test('reports without confirm and changes nothing', async () => {
   assert.equal(value.autoClean, false);
   assert.equal(value.processes.length, 1);
   assert.match(String(value.summary), /report only/);
+  // The summary must name the parameter that actually exists.
+  assert.match(String(value.summary), /auto_clean: true/);
+  assert.ok(!/confirm: true/.test(String(value.summary)), 'no stale flag name in the guidance');
+  // A report must show what was found, not only what would be removed.
+  assert.equal(value.foundArtifacts.length, 2, 'both artifacts are reported');
+  assert.match(render(tool('cleanup_environment'), value), /Build-state artifacts found/);
   assert.equal(value.terminated, 0);
   assert.ok(!stub.calls.some((line) => line.includes('/bin/kill')), 'no signal may be sent without confirm');
   assert.ok(!stub.calls.some((line) => line.includes('shutdown all')), 'no simulator may be shut down');

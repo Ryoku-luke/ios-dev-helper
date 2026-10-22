@@ -50,7 +50,9 @@ them, so the installed plugin stays dependency-free.
 ## Tests
 
 ```sh
-npm test           # compiles, then runs node --test test/*.test.mjs
+npm test           # compiles, then runs node --test "test/*.test.mjs"
+                   # (quoted: Node expands the glob, so the script does not
+                   #  depend on the invoking shell — cmd.exe and PowerShell do not)
 ```
 
 The suite needs no test framework and no network: it drives the plugin against a

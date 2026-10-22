@@ -1,8 +1,10 @@
 # ios-dev-helper
 
+A DSH plugin that gives AI Agents iOS development superpowers: Xcode builds, Simulator control, UI verification, and more.
+
 [![Version](https://img.shields.io/badge/version-1.0.6-blue.svg)](https://github.com/Ryoku-luke/ios-dev-helper/releases)
 [![CI](https://github.com/Ryoku-luke/ios-dev-helper/actions/workflows/ci.yml/badge.svg)](https://github.com/Ryoku-luke/ios-dev-helper/actions/workflows/ci.yml)
-[![License: MIT](https://img.shields.io/badge/license-MIT-green.svg)](https://github.com/Ryoku-luke/ios-dev-helper/blob/main/package.json)
+[![License: MIT](https://img.shields.io/badge/license-MIT-green.svg)](https://github.com/Ryoku-luke/ios-dev-helper/blob/main/LICENSE)
 [![Runtime deps](https://img.shields.io/badge/runtime%20deps-0-brightgreen.svg)](#-架构与限制)
 [![Node](https://img.shields.io/badge/node-%E2%89%A522.6-brightgreen.svg)](https://nodejs.org)
 [![Tests](https://img.shields.io/badge/tests-54%20hermetic%20%2B%203%20integration-blue.svg)](https://github.com/Ryoku-luke/ios-dev-helper/blob/main/test)

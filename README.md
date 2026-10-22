@@ -263,7 +263,12 @@ the PNG, so it can be inspected with the `read_image` tool.
 - Without `path`, the file is written to
   `<cwd>/<screenshotDir>/screenshot-<UTC timestamp>.png` (the directory is created
   on demand). An explicit `path` — absolute, or relative to `cwd` — overrides it.
-- `device` accepts a name, a UDID, or `booted` (the default).
+- `device` accepts a name, a UDID, a **device type** (`iPhone-Duo` or `com.apple.CoreSimulator.SimDeviceType.iPhone-Duo`), or `booted` (the default).
+- `display` captures one panel instead of the default screen
+  (`--display=<value>`). On a foldable the panels are `LCD` (outer) and `LCD-1` (inner),
+  and the folded-away one captures as black unless named; valid values are whatever
+  `xcrun simctl io <device> enumerate` lists (a screen name, a screen ID, `primary`, or a
+  UUID). Omit it and the single-screen behaviour is unchanged.
 - **The capture is attached to the conversation** as an `ImageBlock` through the
   optional `attachments` service, so the model sees the picture without a second
   `read_image` call. Pass `attach: false` to skip that. Without the service, or if
@@ -388,6 +393,25 @@ route — see [Installing idb](#installing-idb).
   hardcodes and does not clean up itself — and retries once, saying so in the
   notes. Only records whose socket file is provably missing are removed, so a live
   companion is never disturbed.
+
+### `duo_fold_state`
+
+Reports the panel state of a foldable simulator such as **iPhone Duo**, which Xcode 27.1
+ships as device type `com.apple.CoreSimulator.SimDeviceType.iPhone-Duo`.
+
+- Panels come from `xcrun simctl io <device> enumerate`, which lists them as
+  `(1) LCD:` / `(3) LCD-1:` blocks: `LCD` is the outer panel, `LCD-1` the inner one.
+- Each integrated panel is then captured **and its pixels measured**. That matters
+  because a folded-away panel is pure black yet still compresses to ~106 KB, so file
+  size proves nothing — the tool reports `litRatio` (the sampled non-black fraction) and
+  `blank` (< 0.1%), and picks `activePanel` as the panel with the larger ratio. When both
+  panels render (unfolded/side-by-side) it says so instead of pretending one is active.
+- **The hinge angle is not available**, and the tool never invents one:
+  `devicectl` has no `device motion` subcommand (only `orientation get|set|rotate`, which
+  is screen rotation), `devicectl device info displays` answers
+  `CoreDeviceError 1001 (com.apple.coredevice.feature.getdisplayinfo)` for a simulator, and
+  `simctl io … enumerate` carries no posture field. `angleUnavailable` states exactly that.
+- `capture: false` reports the enumeration alone and writes no files.
 
 ### `simulator_elements`
 

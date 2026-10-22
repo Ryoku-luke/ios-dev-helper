@@ -176,3 +176,19 @@ test('is deterministic: the same input yields the same command twice', () => {
   const second = invoke({ args: { simulator: 'iPhone 17 Pro', onlyTesting: ['A'] }, action: 'test' });
   assert.deepEqual(first, second);
 });
+
+test('keeps a foldable name exactly as a name, and uses id= for a UDID', () => {
+  const duo = invoke({ args: { simulator: 'iPhone Duo' } });
+  assert.ok(!('error' in duo));
+  assert.equal(duo.destination, 'platform=iOS Simulator,name=iPhone Duo');
+  assert.ok(duo.argv.join(' ').includes('-destination platform=iOS Simulator,name=iPhone Duo'));
+
+  const withOs = invoke({ args: { simulator: 'iPhone Duo', os: '27.1' } });
+  assert.ok(!('error' in withOs));
+  assert.equal(withOs.destination, 'platform=iOS Simulator,name=iPhone Duo,OS=27.1');
+
+  const udid = 'E57CB0C4-444D-43C3-A4B0-66A092085EED';
+  const byId = invoke({ args: { simulator: udid } });
+  assert.ok(!('error' in byId));
+  assert.equal(byId.destination, `platform=iOS Simulator,id=${udid}`);
+});

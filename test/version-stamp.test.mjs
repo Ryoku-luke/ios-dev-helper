@@ -16,7 +16,7 @@ const version = JSON.parse(readFileSync(new URL('../package.json', import.meta.u
 
 test('every tool description ends with the version stamp of this package', () => {
   const { registry } = makeContext();
-  assert.equal(registry.size, 11, 'the plugin registers eleven tools');
+  assert.equal(registry.size, 12, 'the plugin registers twelve tools');
   for (const [name, definition] of registry) {
     assert.equal(
       definition.description.endsWith(`[ios-dev-helper v${version}]`),
